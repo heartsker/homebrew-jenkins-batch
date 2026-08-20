@@ -26,6 +26,13 @@ Without a shared config:
 jenkins-batch setup
 ```
 
+Replace one token:
+
+```sh
+jenkins-batch setup --jenkins
+jenkins-batch setup --issue
+```
+
 ## Use
 
 ```sh
