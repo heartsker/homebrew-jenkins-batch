@@ -1,0 +1,1454 @@
+#!/bin/zsh
+
+set -u
+setopt PIPE_FAIL
+unsetopt BG_NICE
+
+readonly APP_NAME="jenkins-batch"
+readonly APP_VERSION="0.1.0"
+readonly SCRIPT_PATH="${0:A}"
+readonly JENKINS_KEYCHAIN_SERVICE="io.github.heartsker.jenkins-batch.jenkins"
+readonly ISSUE_KEYCHAIN_SERVICE="io.github.heartsker.jenkins-batch.issue-tracker"
+
+umask 077
+
+typeset -g config_file="${JENKINS_BATCH_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/jenkins-batch/config.json}"
+typeset -g runtime_dir=""
+typeset -g cookie_jar=""
+typeset -g crumb_header=""
+typeset -g jenkins_token=""
+typeset -g issue_token=""
+typeset -g watcher_label=""
+
+typeset -g jenkins_url=""
+typeset -g jenkins_user=""
+typeset -g jenkins_insecure="false"
+typeset -g queue_timeout="1800"
+typeset -g build_timeout="21600"
+typeset -g poll_interval="30"
+typeset -g repo_path=""
+typeset -g repo_remote="origin"
+typeset -g branch_owner=""
+typeset -g branch_parameter=""
+typeset -g ticket_pattern='[[:alpha:]][[:alnum:]]*-[[:digit:]]+'
+typeset -g issue_enabled="false"
+typeset -g issue_browse_url=""
+typeset -g issue_api_url=""
+typeset -g issue_user=""
+typeset -g issue_auth_mode="auto"
+typeset -g issue_insecure="false"
+typeset -g issue_parameter=""
+typeset -g log_dir=""
+
+typeset -ga job_labels=()
+typeset -ga job_paths=()
+typeset -ga job_parameters=()
+typeset -ga job_link_labels=()
+typeset -ga job_link_regexes=()
+typeset -ga pipeline_urls=()
+
+help_main() {
+  cat <<'HELP'
+jenkins-batch — launch a configured group of Jenkins jobs.
+
+Usage:
+  jenkins-batch setup [--config FILE]
+  jenkins-batch run [TARGET ...] [options]
+  jenkins-batch cancel [TARGET ...] [options]
+  jenkins-batch doctor
+  jenkins-batch config <path|show|edit>
+
+Start:
+  jenkins-batch setup --config team.json
+  jenkins-batch run
+
+More: jenkins-batch help <setup|run|cancel>
+HELP
+}
+
+help_setup() {
+  cat <<'HELP'
+jenkins-batch setup [--config FILE]
+
+Without FILE: interactive wizard.
+With FILE: import settings, then ask only for identity (if missing) and tokens.
+
+  jenkins-batch setup --config team.json
+
+Config: ~/.config/jenkins-batch/config.json
+Tokens: macOS Keychain
+HELP
+}
+
+help_run() {
+  cat <<'HELP'
+jenkins-batch run [TARGET ...] [options]
+
+Queues every configured job, waits until each leaves the Jenkins queue, prints
+the build URLs, then exits. If issue comments are enabled, small background
+watchers post one comment for each successful build.
+
+Examples:
+  jenkins-batch run
+  jenkins-batch run feature/APP-123-new-flow
+  jenkins-batch run APP-123 APP-124
+  jenkins-batch run APP-123 --dry-run --verbose
+  jenkins-batch run feature/no-ticket --issue APP-123
+HELP
+}
+
+help_cancel() {
+  cat <<'HELP'
+jenkins-batch cancel [TARGET ...] [options]
+
+Finds configured jobs whose branch parameter matches TARGET and stops queued or
+running builds. The exact matches are shown before confirmation.
+
+Examples:
+  jenkins-batch cancel
+  jenkins-batch cancel APP-123 --dry-run
+  jenkins-batch cancel APP-123 --yes
+HELP
+}
+
+show_help() {
+  case "${1:-}" in
+    setup) help_setup ;;
+    run) help_run ;;
+    cancel) help_cancel ;;
+    ""|help) help_main ;;
+    *) fail "Unknown help topic: $1" ;;
+  esac
+}
+
+fail() {
+  print -u2 -- "Error: $*"
+  exit 1
+}
+
+note() {
+  print -u2 -- "$*"
+}
+
+cleanup() {
+  if [[ -n "$runtime_dir" && -d "$runtime_dir" ]]; then
+    rm -rf -- "$runtime_dir"
+  fi
+  runtime_dir=""
+  cookie_jar=""
+  if [[ -n "$watcher_label" ]]; then
+    launchctl remove "$watcher_label" >/dev/null 2>&1
+    watcher_label=""
+  fi
+}
+
+expand_user_path() {
+  local input_path="$1"
+  if [[ "$input_path" == "~" ]]; then
+    print -r -- "$HOME"
+  elif [[ "$input_path" == '~/'* ]]; then
+    print -r -- "$HOME/${input_path#\~/}"
+  else
+    print -r -- "$input_path"
+  fi
+}
+
+prompt() {
+  local label="$1"
+  local default_value="${2:-}"
+  local value=""
+
+  if [[ -n "$default_value" ]]; then
+    read "value?$label [$default_value]: "
+    value="${value:-$default_value}"
+  else
+    read "value?$label: "
+  fi
+  print -r -- "$value"
+}
+
+prompt_required() {
+  local label="$1"
+  local default_value="${2:-}"
+  local value=""
+
+  while [[ -z "$value" ]]; do
+    value="$(prompt "$label" "$default_value")"
+  done
+  print -r -- "$value"
+}
+
+confirm() {
+  local label="$1"
+  local default_answer="${2:-no}"
+  local suffix='[y/N]'
+  local answer=""
+
+  [[ "$default_answer" == "yes" ]] && suffix='[Y/n]'
+  read "answer?$label $suffix: "
+  if [[ -z "$answer" ]]; then
+    [[ "$default_answer" == "yes" ]]
+    return
+  fi
+  case "$answer" in
+    y|Y|yes|YES) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+prompt_secret() {
+  local label="$1"
+  local value=""
+  read -s "value?$label: "
+  print -u2
+  print -r -- "$value"
+}
+
+save_secret() {
+  local service="$1"
+  local account="$2"
+  local secret="$3"
+
+  security add-generic-password -U -a "$account" -s "$service" -w "$secret" >/dev/null \
+    || fail "Could not save the credential in Keychain"
+}
+
+parameters_json() {
+  local input="$1"
+  local result='{}'
+  local pair key value
+  local -a pairs=()
+
+  [[ -z "$input" ]] && { print -r -- "$result"; return; }
+  pairs=("${(@s:,:)input}")
+  for pair in "${pairs[@]}"; do
+    [[ "$pair" == *=* ]] || fail "Invalid parameter '$pair'; expected KEY=value"
+    key="${pair%%=*}"
+    value="${pair#*=}"
+    [[ "$key" =~ '^[A-Za-z_][A-Za-z0-9_.-]*$' ]] \
+      || fail "Invalid parameter name: $key"
+    result="$(jq -c --arg key "$key" --arg value "$value" '. + {($key): $value}' <<< "$result")" \
+      || fail "Could not encode job parameters"
+  done
+  print -r -- "$result"
+}
+
+config_contains_secrets() {
+  jq -e '
+    [
+      .. | objects | keys[] | ascii_downcase
+      | select(
+          . == "token" or
+          . == "tokens" or
+          . == "apitoken" or
+          . == "accesstoken" or
+          . == "apikey" or
+          . == "password" or
+          . == "passwords" or
+          . == "secret" or
+          . == "secrets" or
+          . == "clientsecret" or
+          . == "privatekey" or
+          . == "secretkey" or
+          . == "authorization" or
+          . == "cookie" or
+          . == "credential" or
+          . == "credentials"
+        )
+    ]
+    | length > 0
+  ' "$1" >/dev/null 2>&1
+}
+
+validate_config_file() {
+  local file="$1"
+  jq -e '
+    .version == 1 and
+    (.jenkins | type == "object") and
+    (.jenkins.url | type == "string" and length > 0) and
+    (.jenkins.user | type == "string" and length > 0) and
+    ((.jenkins.tokenUrl // "") | type == "string") and
+    ((.jenkins.insecure // false) | type == "boolean") and
+    ((.jenkins.queueTimeout // 1800) | type == "number") and
+    ((.jenkins.buildTimeout // 21600) | type == "number") and
+    ((.jenkins.pollInterval // 30) | type == "number") and
+    (.repository | type == "object") and
+    (.repository.path | type == "string" and length > 0) and
+    ((.repository.remote // "origin") | type == "string") and
+    ((.repository.branchOwner // "") | type == "string") and
+    ((.repository.branchParameter // "") | type == "string") and
+    ((.repository.ticketPattern // "") | type == "string") and
+    (.issueTracker | type == "object") and
+    ((.issueTracker.enabled // false) | type == "boolean") and
+    ((.issueTracker.browseUrl // "") | type == "string") and
+    ((.issueTracker.apiUrl // "") | type == "string") and
+    ((.issueTracker.user // "") | type == "string") and
+    ((.issueTracker.tokenUrl // "") | type == "string") and
+    ((.issueTracker.authMode // "auto") | IN("auto", "basic", "bearer")) and
+    ((.issueTracker.insecure // false) | type == "boolean") and
+    ((.issueTracker.jobParameter // "") | type == "string") and
+    (if (.issueTracker.enabled // false) then
+      (.issueTracker.browseUrl | length > 0) and
+      (.issueTracker.apiUrl | length > 0) and
+      (.issueTracker.user | length > 0)
+    else true end) and
+    ((.logDirectory // "~/Library/Logs/jenkins-batch") | type == "string") and
+    (.jobs | type == "array" and length > 0) and
+    all(.jobs[];
+      (.label | type == "string" and length > 0) and
+      (.path | type == "string" and length > 0) and
+      ((.parameters // {}) | type == "object") and
+      ((.linkLabel // "") | type == "string") and
+      ((.linkRegex // "") | type == "string")
+    ) and
+    (any(.. | strings; contains("{{user}}")) | not)
+  ' "$file" >/dev/null 2>&1
+}
+
+default_issue_token_url() {
+  local api_url="$1"
+  local base_url="${api_url%%/rest/api/*}"
+  if [[ "$base_url" == "$api_url" ]]; then
+    base_url="$(print -r -- "$api_url" | sed -E 's#^(https?://[^/]+).*$#\1#')"
+  fi
+  print -r -- "${base_url%/}/secure/ViewProfile.jspa"
+}
+
+save_setup_credentials() {
+  local file="$1"
+  local configured_jenkins_url configured_jenkins_user jenkins_token_url
+  local configured_issue_enabled configured_issue_user issue_token_url configured_issue_api_url
+  local token
+
+  configured_jenkins_url="$(jq -r '.jenkins.url' "$file")"
+  configured_jenkins_user="$(jq -r '.jenkins.user' "$file")"
+  jenkins_token_url="$(jq -r '.jenkins.tokenUrl // empty' "$file")"
+  [[ -n "$jenkins_token_url" ]] || jenkins_token_url="${configured_jenkins_url%/}/me/configure"
+
+  print -- "Jenkins token: $jenkins_token_url"
+  token="$(prompt_secret "Token")"
+  [[ -n "$token" ]] || fail "Token cannot be empty"
+  save_secret "$JENKINS_KEYCHAIN_SERVICE" "$configured_jenkins_user" "$token"
+
+  configured_issue_enabled="$(jq -r '.issueTracker.enabled // false' "$file")"
+  if [[ "$configured_issue_enabled" == "true" ]]; then
+    configured_issue_user="$(jq -r '.issueTracker.user' "$file")"
+    configured_issue_api_url="$(jq -r '.issueTracker.apiUrl' "$file")"
+    issue_token_url="$(jq -r '.issueTracker.tokenUrl // empty' "$file")"
+    [[ -n "$issue_token_url" ]] || issue_token_url="$(default_issue_token_url "$configured_issue_api_url")"
+    print -- "Jira token: $issue_token_url"
+    token="$(prompt_secret "Token")"
+    [[ -n "$token" ]] || fail "Token cannot be empty"
+    save_secret "$ISSUE_KEYCHAIN_SERVICE" "$configured_issue_user" "$token"
+  fi
+}
+
+setup_from_config() {
+  local source_file
+  source_file="$(expand_user_path "$1")"
+  [[ -f "$source_file" ]] || fail "Config not found: $source_file"
+  command -v jq >/dev/null 2>&1 || fail "jq is required; install with: brew install jq"
+  command -v security >/dev/null 2>&1 || fail "macOS Keychain is required"
+
+  if [[ -f "$config_file" ]] && ! confirm "Replace current config?" "no"; then
+    return
+  fi
+
+  runtime_dir="$(mktemp -d "${TMPDIR:-/tmp}/jenkins-batch-setup.XXXXXX")" \
+    || fail "Could not create temporary setup files"
+  local candidate="$runtime_dir/config.json"
+  local resolved="$runtime_dir/resolved.json"
+  jq . "$source_file" > "$candidate" 2>/dev/null || fail "Invalid JSON: $source_file"
+  config_contains_secrets "$candidate" && fail "Config must not contain tokens or passwords"
+
+  local needs_user setup_user=""
+  needs_user="$(jq -r 'any(.. | strings; contains("{{user}}"))' "$candidate")"
+  if [[ "$needs_user" == "true" ]]; then
+    setup_user="$(prompt_required "Username" "${USER:-}")"
+    jq --arg user "$setup_user" '
+      walk(if type == "string" then gsub("\\{\\{user\\}\\}"; $user) else . end)
+    ' "$candidate" > "$resolved" || fail "Could not resolve {{user}}"
+    mv -f "$resolved" "$candidate"
+  fi
+
+  local configured_jenkins_user configured_issue_enabled configured_issue_user
+  configured_jenkins_user="$(jq -r '.jenkins.user // empty' "$candidate")"
+  if [[ -z "$configured_jenkins_user" ]]; then
+    configured_jenkins_user="$(prompt_required "Jenkins username" "${USER:-}")"
+    jq --arg user "$configured_jenkins_user" '.jenkins.user = $user' "$candidate" > "$resolved"
+    mv -f "$resolved" "$candidate"
+  fi
+  configured_issue_enabled="$(jq -r '.issueTracker.enabled // false' "$candidate")"
+  configured_issue_user="$(jq -r '.issueTracker.user // empty' "$candidate")"
+  if [[ "$configured_issue_enabled" == "true" && -z "$configured_issue_user" ]]; then
+    jq --arg user "$configured_jenkins_user" '.issueTracker.user = $user' "$candidate" > "$resolved"
+    mv -f "$resolved" "$candidate"
+  fi
+
+  validate_config_file "$candidate" || fail "Invalid config: $source_file"
+  save_setup_credentials "$candidate"
+
+  local config_dir temporary_config
+  config_dir="$(dirname "$config_file")"
+  mkdir -p "$config_dir" || fail "Could not create $config_dir"
+  temporary_config="$(mktemp "$config_dir/config.XXXXXX")" || fail "Could not create configuration"
+  jq . "$candidate" > "$temporary_config" || fail "Could not write configuration"
+  chmod 600 "$temporary_config"
+  mv -f "$temporary_config" "$config_file"
+  cleanup
+  print -- "Ready."
+}
+
+setup_command() {
+  local source_file=""
+  while (( $# > 0 )); do
+    case "$1" in
+      --config)
+        (( $# >= 2 )) || fail "--config needs a file"
+        source_file="$2"
+        shift 2
+        ;;
+      -h|--help) help_setup; return ;;
+      --*) fail "Unknown option: $1" ;;
+      *)
+        [[ -z "$source_file" ]] || fail "Only one config file is allowed"
+        source_file="$1"
+        shift
+        ;;
+    esac
+  done
+
+  [[ -n "$source_file" ]] && setup_from_config "$source_file" || setup_wizard
+}
+
+setup_wizard() {
+  command -v jq >/dev/null 2>&1 || fail "jq is required; install with: brew install jq"
+  command -v security >/dev/null 2>&1 || fail "macOS Keychain is required"
+
+  if [[ -f "$config_file" ]] && ! confirm "Replace current config?" "no"; then
+    return
+  fi
+
+  print -- "Setup"
+
+  local default_repo="$PWD"
+  local detected_repo
+  detected_repo="$(git rev-parse --show-toplevel 2>/dev/null || true)"
+  [[ -n "$detected_repo" ]] && default_repo="$detected_repo"
+
+  local setup_jenkins_url setup_jenkins_user setup_jenkins_token_url setup_repo setup_remote setup_owner
+  local setup_branch_parameter setup_ticket_pattern setup_log_dir
+  setup_jenkins_url="$(prompt_required "Jenkins URL" "https://jenkins.example.com")"
+  setup_jenkins_url="${setup_jenkins_url%/}"
+  setup_jenkins_user="$(prompt_required "Jenkins username")"
+  setup_jenkins_token_url="$setup_jenkins_url/me/configure"
+  setup_repo="$(prompt_required "Local repository" "$default_repo")"
+  setup_repo="$(expand_user_path "$setup_repo")"
+  setup_remote="$(prompt "Git remote" "origin")"
+  setup_owner="$(prompt "Remote branch namespace (optional)")"
+  setup_branch_parameter="$(prompt "Jenkins branch parameter" "sourceBranch")"
+  setup_ticket_pattern="$(prompt "Issue key regex" '[[:alpha:]][[:alnum:]]*-[[:digit:]]+')"
+  setup_log_dir="$(prompt "Watcher log directory" "~/Library/Logs/jenkins-batch")"
+
+  local setup_queue_timeout setup_build_timeout setup_poll_interval setup_jenkins_insecure="false"
+  setup_queue_timeout="$(prompt "Queue timeout in seconds" "1800")"
+  setup_build_timeout="$(prompt "Build timeout in seconds" "21600")"
+  setup_poll_interval="$(prompt "Build poll interval in seconds" "30")"
+  validate_integer "Queue timeout" "$setup_queue_timeout"
+  validate_integer "Build timeout" "$setup_build_timeout"
+  validate_integer "Build poll interval" "$setup_poll_interval"
+  confirm "Disable Jenkins TLS verification?" "no" && setup_jenkins_insecure="true"
+
+  local setup_issue_enabled="false"
+  local setup_issue_browse_url="" setup_issue_api_url="" setup_issue_user="" setup_issue_token_url=""
+  local setup_issue_auth_mode="auto" setup_issue_parameter="" setup_issue_insecure="false"
+  if confirm "Configure Jira-compatible completion comments?" "no"; then
+    setup_issue_enabled="true"
+    setup_issue_browse_url="$(prompt_required "Issue browse URL" "https://jira.example.com/browse")"
+    setup_issue_browse_url="${setup_issue_browse_url%/}"
+    setup_issue_api_url="$(prompt_required "Issue REST API URL" "https://jira.example.com/rest/api/2")"
+    setup_issue_api_url="${setup_issue_api_url%/}"
+    setup_issue_user="$(prompt_required "Issue tracker username")"
+    setup_issue_token_url="$(default_issue_token_url "$setup_issue_api_url")"
+    setup_issue_auth_mode="$(prompt "Authentication mode (auto, basic, bearer)" "auto")"
+    case "$setup_issue_auth_mode" in
+      auto|basic|bearer) ;;
+      *) fail "Authentication mode must be auto, basic, or bearer" ;;
+    esac
+    setup_issue_parameter="$(prompt "Jenkins issue URL parameter (optional)" "ISSUE_URL")"
+    confirm "Disable issue tracker TLS verification?" "no" && setup_issue_insecure="true"
+  fi
+
+  local job_count
+  job_count="$(prompt "Number of jobs in the batch" "3")"
+  case "$job_count" in
+    ''|*[!0-9]*) fail "Job count must be a positive integer" ;;
+  esac
+  (( job_count > 0 )) || fail "Job count must be a positive integer"
+
+  local jobs='[]'
+  local index label job_path raw_parameters encoded_parameters link_label link_regex
+  for (( index = 1; index <= job_count; index += 1 )); do
+    print
+    print -- "Job $index"
+    label="$(prompt_required "  Display name" "Job $index")"
+    job_path="$(prompt_required "  Jenkins job path")"
+    raw_parameters="$(prompt "  Parameters (KEY=value, comma-separated)")"
+    encoded_parameters="$(parameters_json "$raw_parameters")"
+    link_regex="$(prompt "  Artifact URL regex for comments (optional)")"
+    link_label=""
+    [[ -n "$link_regex" ]] && link_label="$(prompt "  Artifact link label" "Artifact")"
+
+    jobs="$(jq -c \
+      --arg label "$label" \
+      --arg path "$job_path" \
+      --argjson parameters "$encoded_parameters" \
+      --arg linkLabel "$link_label" \
+      --arg linkRegex "$link_regex" \
+      '. + [{label: $label, path: $path, parameters: $parameters, linkLabel: $linkLabel, linkRegex: $linkRegex}]' \
+      <<< "$jobs")" || fail "Could not encode jobs"
+  done
+
+  local config_dir temporary_config
+  config_dir="$(dirname "$config_file")"
+  mkdir -p "$config_dir" || fail "Could not create $config_dir"
+  temporary_config="$(mktemp "$config_dir/config.XXXXXX")" || fail "Could not create configuration"
+
+  jq -n \
+    --arg url "$setup_jenkins_url" \
+    --arg user "$setup_jenkins_user" \
+    --arg jenkinsTokenUrl "$setup_jenkins_token_url" \
+    --argjson insecure "$setup_jenkins_insecure" \
+    --argjson queueTimeout "$setup_queue_timeout" \
+    --argjson buildTimeout "$setup_build_timeout" \
+    --argjson pollInterval "$setup_poll_interval" \
+    --arg path "$setup_repo" \
+    --arg remote "$setup_remote" \
+    --arg branchOwner "$setup_owner" \
+    --arg branchParameter "$setup_branch_parameter" \
+    --arg ticketPattern "$setup_ticket_pattern" \
+    --argjson issueEnabled "$setup_issue_enabled" \
+    --arg browseUrl "$setup_issue_browse_url" \
+    --arg apiUrl "$setup_issue_api_url" \
+    --arg issueUser "$setup_issue_user" \
+    --arg issueTokenUrl "$setup_issue_token_url" \
+    --arg authMode "$setup_issue_auth_mode" \
+    --argjson issueInsecure "$setup_issue_insecure" \
+    --arg issueParameter "$setup_issue_parameter" \
+    --arg logDirectory "$setup_log_dir" \
+    --argjson jobs "$jobs" \
+    '{
+      version: 1,
+      jenkins: {
+        url: $url,
+        user: $user,
+        tokenUrl: $jenkinsTokenUrl,
+        insecure: $insecure,
+        queueTimeout: $queueTimeout,
+        buildTimeout: $buildTimeout,
+        pollInterval: $pollInterval
+      },
+      repository: {
+        path: $path,
+        remote: $remote,
+        branchOwner: $branchOwner,
+        branchParameter: $branchParameter,
+        ticketPattern: $ticketPattern
+      },
+      issueTracker: {
+        enabled: $issueEnabled,
+        browseUrl: $browseUrl,
+        apiUrl: $apiUrl,
+        user: $issueUser,
+        tokenUrl: $issueTokenUrl,
+        authMode: $authMode,
+        insecure: $issueInsecure,
+        jobParameter: $issueParameter
+      },
+      logDirectory: $logDirectory,
+      jobs: $jobs
+    }' > "$temporary_config" || fail "Could not write configuration"
+
+  chmod 600 "$temporary_config"
+  mv -f "$temporary_config" "$config_file"
+
+  save_setup_credentials "$config_file"
+  print -- "Ready."
+}
+
+validate_integer() {
+  local name="$1"
+  local value="$2"
+  case "$value" in
+    ''|*[!0-9]*) fail "$name must be a positive integer" ;;
+  esac
+  (( value > 0 )) || fail "$name must be a positive integer"
+}
+
+load_jobs() {
+  job_labels=()
+  job_paths=()
+  job_parameters=()
+  job_link_labels=()
+  job_link_regexes=()
+
+  local label job_path parameters link_label link_regex
+  while IFS=$'\t' read -r label job_path parameters link_label link_regex; do
+    [[ -n "$label" && -n "$job_path" ]] || fail "Every job needs a label and path"
+    job_labels+=("$label")
+    job_paths+=("$job_path")
+    job_parameters+=("$parameters")
+    job_link_labels+=("$link_label")
+    job_link_regexes+=("$link_regex")
+  done < <(jq -r '.jobs[] | [.label, .path, (.parameters // {} | tojson), (.linkLabel // ""), (.linkRegex // "")] | @tsv' "$config_file")
+
+  (( ${#job_labels[@]} > 0 )) || fail "No jobs are configured; run: jenkins-batch setup"
+}
+
+load_config() {
+  command -v jq >/dev/null 2>&1 || fail "jq is required; install with: brew install jq"
+  [[ -f "$config_file" ]] || fail "Not configured. Run: jenkins-batch setup"
+  validate_config_file "$config_file" || fail "Invalid configuration: $config_file"
+  config_contains_secrets "$config_file" && fail "Config contains a token or password"
+
+  jenkins_url="$(jq -r '.jenkins.url' "$config_file")"
+  jenkins_url="${jenkins_url%/}"
+  jenkins_user="$(jq -r '.jenkins.user' "$config_file")"
+  jenkins_insecure="$(jq -r '.jenkins.insecure // false' "$config_file")"
+  queue_timeout="$(jq -r '.jenkins.queueTimeout // 1800' "$config_file")"
+  build_timeout="$(jq -r '.jenkins.buildTimeout // 21600' "$config_file")"
+  poll_interval="$(jq -r '.jenkins.pollInterval // 30' "$config_file")"
+  repo_path="$(expand_user_path "$(jq -r '.repository.path' "$config_file")")"
+  repo_remote="$(jq -r '.repository.remote // "origin"' "$config_file")"
+  branch_owner="$(jq -r '.repository.branchOwner // ""' "$config_file")"
+  branch_parameter="$(jq -r '.repository.branchParameter // ""' "$config_file")"
+  ticket_pattern="$(jq -r '.repository.ticketPattern // "[[:alpha:]][[:alnum:]]*-[[:digit:]]+"' "$config_file")"
+  issue_enabled="$(jq -r '.issueTracker.enabled // false' "$config_file")"
+  issue_browse_url="$(jq -r '.issueTracker.browseUrl // ""' "$config_file")"
+  issue_browse_url="${issue_browse_url%/}"
+  issue_api_url="$(jq -r '.issueTracker.apiUrl // ""' "$config_file")"
+  issue_api_url="${issue_api_url%/}"
+  issue_user="$(jq -r '.issueTracker.user // ""' "$config_file")"
+  issue_auth_mode="$(jq -r '.issueTracker.authMode // "auto"' "$config_file")"
+  issue_insecure="$(jq -r '.issueTracker.insecure // false' "$config_file")"
+  issue_parameter="$(jq -r '.issueTracker.jobParameter // ""' "$config_file")"
+  log_dir="$(expand_user_path "$(jq -r '.logDirectory // "~/Library/Logs/jenkins-batch"' "$config_file")")"
+
+  validate_integer "queueTimeout" "$queue_timeout"
+  validate_integer "buildTimeout" "$build_timeout"
+  validate_integer "pollInterval" "$poll_interval"
+  case "$issue_auth_mode" in
+    auto|basic|bearer) ;;
+    *) fail "issueTracker.authMode must be auto, basic, or bearer" ;;
+  esac
+  load_jobs
+}
+
+load_jenkins_token() {
+  jenkins_token="${JENKINS_BATCH_TOKEN:-}"
+  if [[ -z "$jenkins_token" ]]; then
+    jenkins_token="$(security find-generic-password -a "$jenkins_user" -s "$JENKINS_KEYCHAIN_SERVICE" -w 2>/dev/null)"
+  fi
+  [[ -n "$jenkins_token" ]] || fail "Jenkins token not found. Run: jenkins-batch setup"
+}
+
+load_issue_token() {
+  [[ "$issue_enabled" == "true" ]] || return
+  issue_token="${JENKINS_BATCH_ISSUE_TOKEN:-}"
+  if [[ -z "$issue_token" ]]; then
+    issue_token="$(security find-generic-password -a "$issue_user" -s "$ISSUE_KEYCHAIN_SERVICE" -w 2>/dev/null)"
+  fi
+  [[ -n "$issue_token" ]] || fail "Issue tracker credential not found. Run: jenkins-batch setup"
+}
+
+doctor() {
+  local failures=0
+  local tool
+  print -- "Jenkins Batch $APP_VERSION"
+  for tool in zsh curl jq git security launchctl; do
+    if command -v "$tool" >/dev/null 2>&1; then
+      print -- "✓ $tool"
+    else
+      print -- "✗ $tool"
+      (( failures += 1 ))
+    fi
+  done
+
+  if [[ ! -f "$config_file" ]]; then
+    print -- "✗ config — run: jenkins-batch setup"
+    return 1
+  fi
+
+  load_config
+  print -- "✓ config — ${#job_labels[@]} jobs"
+  [[ -d "$repo_path/.git" ]] && print -- "✓ repository" || { print -- "✗ repository — $repo_path"; (( failures += 1 )); }
+  if security find-generic-password -a "$jenkins_user" -s "$JENKINS_KEYCHAIN_SERVICE" -w >/dev/null 2>&1 \
+      || [[ -n "${JENKINS_BATCH_TOKEN:-}" ]]; then
+    print -- "✓ Jenkins credential"
+  else
+    print -- "✗ Jenkins credential — run setup again"
+    (( failures += 1 ))
+  fi
+  if [[ "$issue_enabled" == "true" ]]; then
+    if security find-generic-password -a "$issue_user" -s "$ISSUE_KEYCHAIN_SERVICE" -w >/dev/null 2>&1 \
+        || [[ -n "${JENKINS_BATCH_ISSUE_TOKEN:-}" ]]; then
+      print -- "✓ issue tracker credential"
+    else
+      print -- "✗ issue tracker credential — run setup again"
+      (( failures += 1 ))
+    fi
+  fi
+
+  (( failures == 0 )) || return 1
+  print -- "Ready. Try: jenkins-batch run --dry-run"
+}
+
+config_command() {
+  case "${1:-show}" in
+    path) print -r -- "$config_file" ;;
+    show)
+      [[ -f "$config_file" ]] || fail "Not configured. Run: jenkins-batch setup"
+      jq . "$config_file"
+      ;;
+    edit)
+      [[ -f "$config_file" ]] || fail "Not configured. Run: jenkins-batch setup"
+      "${EDITOR:-vi}" "$config_file"
+      ;;
+    *) fail "Usage: jenkins-batch config <path|show|edit>" ;;
+  esac
+}
+
+is_issue_key() {
+  print -r -- "$1" | grep -Eiq "^(${ticket_pattern})$"
+}
+
+extract_issue_key() {
+  print -r -- "$1" \
+    | grep -Eio "$ticket_pattern" \
+    | head -n 1 \
+    | tr '[:lower:]' '[:upper:]'
+}
+
+resolve_ticket_branch() {
+  local key="$1"
+  local remote_heads matches count
+  [[ -n "$branch_owner" ]] || { print -r -- "$key"; return; }
+  [[ -d "$repo_path/.git" ]] || fail "Repository not found: $repo_path"
+
+  note "Finding $key in $repo_remote/$branch_owner/*…"
+  remote_heads="$(git -C "$repo_path" ls-remote --heads "$repo_remote" "refs/heads/$branch_owner/*" 2>/dev/null)" \
+    || fail "Could not read remote branches"
+  matches="$(print -r -- "$remote_heads" \
+    | awk '{ sub(/^refs\/heads\//, "", $2); print $2 }' \
+    | grep -Ei "(^|[^[:alnum:]])${key}([^[:digit:]]|$)" \
+    || true)"
+  [[ -n "$matches" ]] || fail "No remote branch found for $key"
+  count="$(print -r -- "$matches" | sed '/^$/d' | wc -l | tr -d ' ')"
+  if (( count > 1 )); then
+    note "Multiple branches found:"
+    print -u2 -r -- "$matches"
+    fail "Pass the full branch name"
+  fi
+  print -r -- "$matches"
+}
+
+resolve_branch() {
+  local target="${1:-}"
+  local resolved=""
+  if [[ -z "$target" ]]; then
+    [[ -d "$repo_path/.git" ]] || fail "Repository not found: $repo_path"
+    resolved="$(git -C "$repo_path" branch --show-current 2>/dev/null)"
+  elif is_issue_key "$target" && [[ -n "$branch_owner" ]]; then
+    resolved="$(resolve_ticket_branch "$(print -r -- "$target" | tr '[:lower:]' '[:upper:]')")"
+  else
+    resolved="$target"
+  fi
+  [[ -n "$resolved" ]] || fail "Could not resolve a branch; pass one explicitly"
+  [[ "$resolved" != *$'\n'* && "$resolved" != *$'\r'* ]] || fail "Invalid branch name"
+  print -r -- "$resolved"
+}
+
+url_encode() {
+  jq -rn --arg value "$1" '$value | @uri'
+}
+
+job_api_url() {
+  local job_path="$1"
+  local result="$jenkins_url"
+  local segment
+  local -a segments=("${(@s:/:)job_path}")
+  for segment in "${segments[@]}"; do
+    [[ -n "$segment" ]] || continue
+    result+="/job/$(url_encode "$segment")"
+  done
+  print -r -- "$result"
+}
+
+build_parameters() {
+  local index="$1"
+  local branch="$2"
+  local issue_url="$3"
+  [[ -n "$branch_parameter" ]] && print -r -- "$branch_parameter=$branch"
+  [[ -n "$issue_parameter" && -n "$issue_url" ]] && print -r -- "$issue_parameter=$issue_url"
+  jq -r --arg branch "$branch" --arg issueUrl "$issue_url" '
+    to_entries[]
+    | .key + "=" + (
+        (.value | tostring)
+        | gsub("\\{\\{branch\\}\\}"; $branch)
+        | gsub("\\{\\{issue_url\\}\\}"; $issueUrl)
+      )
+  ' <<< "${job_parameters[$index]}"
+}
+
+print_plan() {
+  local branch="$1"
+  local issue_key="$2"
+  local verbose="$3"
+  local issue_url=""
+  [[ -n "$issue_key" && -n "$issue_browse_url" ]] && issue_url="$issue_browse_url/$issue_key"
+
+  print -- "Branch: $branch"
+  [[ -n "$issue_key" ]] && print -- "Issue:  $issue_key"
+  local index parameter
+  local -a parameters=()
+  for (( index = 1; index <= ${#job_labels[@]}; index += 1 )); do
+    print -- "• ${job_labels[$index]} → ${job_paths[$index]}"
+    if [[ "$verbose" == "true" ]]; then
+      parameters=("${(@f)$(build_parameters "$index" "$branch" "$issue_url")}")
+      for parameter in "${parameters[@]}"; do
+        [[ -n "$parameter" ]] && print -- "    $parameter"
+      done
+    fi
+  done
+}
+
+load_runtime() {
+  runtime_dir="$(mktemp -d "${TMPDIR:-/tmp}/jenkins-batch.XXXXXX")" \
+    || fail "Could not create a temporary directory"
+  cookie_jar="$runtime_dir/cookies"
+  touch "$cookie_jar"
+}
+
+curl_config_escape() {
+  local value="$1"
+  [[ "$value" != *$'\n'* && "$value" != *$'\r'* ]] || fail "Credential contains an unsupported newline"
+  print -r -- "$value" | sed 's/\\/\\\\/g; s/"/\\"/g'
+}
+
+write_curl_auth_config() {
+  local output_file="$1"
+  local mode="$2"
+  local user="$3"
+  local secret="$4"
+  local escaped
+  case "$mode" in
+    basic)
+      escaped="$(curl_config_escape "$user:$secret")"
+      print -r -- "user = \"$escaped\"" > "$output_file"
+      ;;
+    bearer)
+      escaped="$(curl_config_escape "Authorization: Bearer $secret")"
+      print -r -- "header = \"$escaped\"" > "$output_file"
+      ;;
+    *) fail "Unsupported curl authentication mode: $mode" ;;
+  esac
+  chmod 600 "$output_file"
+}
+
+curl_common_args() {
+  local auth_file="$runtime_dir/jenkins-auth.conf"
+  write_curl_auth_config "$auth_file" basic "$jenkins_user" "$jenkins_token"
+  reply=(
+    --silent
+    --show-error
+    --globoff
+    --connect-timeout 15
+    --max-time 60
+    --config "$auth_file"
+    --cookie "$cookie_jar"
+    --cookie-jar "$cookie_jar"
+    --header "Accept: application/json"
+  )
+  [[ "$jenkins_insecure" == "true" ]] && reply+=(--insecure)
+}
+
+api_get() {
+  local url="$1"
+  local output_file="$2"
+  local -a args
+  curl_common_args
+  args=("${reply[@]}")
+  curl "${args[@]}" --output "$output_file" --write-out '%{http_code}' "$url"
+}
+
+api_post() {
+  local url="$1"
+  local output_file="$2"
+  shift 2
+  local parameter
+  local -a args data_args=()
+  curl_common_args
+  args=("${reply[@]}")
+  [[ -n "$crumb_header" ]] && args+=(--header "$crumb_header")
+  for parameter in "$@"; do
+    data_args+=(--data-urlencode "$parameter")
+  done
+  curl "${args[@]}" \
+    --request POST \
+    --output "$output_file" \
+    --write-out '%{http_code}' \
+    "${data_args[@]}" \
+    "$url"
+}
+
+prepare_jenkins_session() {
+  local body="$runtime_dir/auth.json"
+  local http_code authenticated
+  http_code="$(api_get "$jenkins_url/whoAmI/api/json" "$body")" || fail "Jenkins is unavailable"
+  [[ "$http_code" == "200" ]] || fail "Jenkins authentication failed (HTTP $http_code)"
+  authenticated="$(jq -r '.authenticated // false' "$body" 2>/dev/null)"
+  [[ "$authenticated" == "true" ]] || fail "Jenkins rejected the API token"
+
+  body="$runtime_dir/crumb.json"
+  http_code="$(api_get "$jenkins_url/crumbIssuer/api/json" "$body")" \
+    || fail "Could not request a Jenkins crumb"
+  case "$http_code" in
+    200)
+      local field crumb
+      field="$(jq -r '.crumbRequestField // empty' "$body")"
+      crumb="$(jq -r '.crumb // empty' "$body")"
+      [[ -n "$field" && -n "$crumb" ]] || fail "Jenkins returned an invalid crumb"
+      crumb_header="$field: $crumb"
+      ;;
+    404) crumb_header="" ;;
+    *) fail "Could not request a Jenkins crumb (HTTP $http_code)" ;;
+  esac
+}
+
+normalize_queue_url() {
+  local location="$1"
+  local origin
+  if [[ "$location" == http://* || "$location" == https://* ]]; then
+    print -r -- "$location"
+    return
+  fi
+  origin="$(print -r -- "$jenkins_url" | sed -E 's#^(https?://[^/]+).*$#\1#')"
+  [[ "$location" == /* ]] && print -r -- "$origin$location" || print -r -- "$jenkins_url/$location"
+}
+
+trigger_build() {
+  local index="$1"
+  shift
+  local slug="job-$index"
+  local job_url headers body endpoint http_code location parameter
+  local -a args data_args=()
+  job_url="$(job_api_url "${job_paths[$index]}")"
+  headers="$runtime_dir/trigger-$slug.headers"
+  body="$runtime_dir/trigger-$slug.body"
+  endpoint="$job_url/build"
+
+  curl_common_args
+  args=("${reply[@]}")
+  [[ -n "$crumb_header" ]] && args+=(--header "$crumb_header")
+  if (( $# > 0 )); then
+    endpoint="$job_url/buildWithParameters"
+    for parameter in "$@"; do
+      data_args+=(--data-urlencode "$parameter")
+    done
+  fi
+
+  http_code="$(curl "${args[@]}" \
+    --request POST \
+    --dump-header "$headers" \
+    --output "$body" \
+    --write-out '%{http_code}' \
+    "${data_args[@]}" \
+    "$endpoint")" || return 1
+  [[ "$http_code" == "201" ]] || {
+    note "${job_labels[$index]} was not queued (HTTP $http_code)"
+    [[ -s "$body" ]] && sed -n '1,8p' "$body" >&2
+    return 1
+  }
+  location="$(awk 'tolower($1) == "location:" { sub(/\r$/, "", $2); print $2 }' "$headers" | tail -n 1)"
+  [[ -n "$location" ]] || { note "Jenkins did not return a queue URL for ${job_labels[$index]}"; return 1; }
+  normalize_queue_url "$location"
+}
+
+queue_pipeline_url() {
+  local queue_url="$1"
+  local index="$2"
+  local body="$runtime_dir/queue-$index.json"
+  local http_code cancelled build_url
+  http_code="$(api_get "${queue_url%/}/api/json" "$body")" || return 4
+  [[ "$http_code" == "200" ]] || return 4
+  cancelled="$(jq -r '.cancelled // false' "$body")"
+  [[ "$cancelled" == "true" ]] && return 2
+  build_url="$(jq -r '.executable.url // empty' "$body")"
+  [[ -n "$build_url" ]] && { print -r -- "$build_url"; return 0; }
+  return 3
+}
+
+wait_for_starts() {
+  local -a queue_urls=("$@")
+  local -a states=()
+  pipeline_urls=()
+  local count=${#job_labels[@]}
+  local index completed=0 failures=0 elapsed=0 queue_status build_url
+  for (( index = 1; index <= count; index += 1 )); do
+    states+=("pending")
+    pipeline_urls+=("")
+  done
+  note "Waiting for $count jobs to start…"
+  while (( completed < count )); do
+    for (( index = 1; index <= count; index += 1 )); do
+      [[ "${states[$index]}" == "pending" ]] || continue
+      if [[ -z "${queue_urls[$index]:-}" ]]; then
+        states[$index]="failed"
+        (( completed += 1, failures += 1 ))
+        continue
+      fi
+      build_url="$(queue_pipeline_url "${queue_urls[$index]}" "$index")"
+      queue_status=$?
+      case "$queue_status" in
+        0)
+          pipeline_urls[$index]="$build_url"
+          states[$index]="started"
+          (( completed += 1 ))
+          note "✓ ${job_labels[$index]}: $build_url"
+          ;;
+        2)
+          states[$index]="cancelled"
+          (( completed += 1, failures += 1 ))
+          note "✗ ${job_labels[$index]} was cancelled in the queue"
+          ;;
+        3) ;;
+        *)
+          states[$index]="failed"
+          (( completed += 1, failures += 1 ))
+          note "✗ Could not read ${job_labels[$index]} queue state"
+          ;;
+      esac
+    done
+    (( completed == count )) && break
+    (( elapsed < queue_timeout )) || { note "Queue timeout after ${queue_timeout}s"; return 1; }
+    sleep 5
+    (( elapsed += 5 ))
+  done
+  (( failures == 0 ))
+}
+
+run_one() {
+  local target="$1"
+  local issue_override="$2"
+  local dry_run="$3"
+  local comments="$4"
+  local verbose="$5"
+  local branch issue_key issue_url=""
+  branch="$(resolve_branch "$target")"
+  issue_key="$issue_override"
+  if [[ -z "$issue_key" && "$issue_enabled" == "true" ]]; then
+    issue_key="$(extract_issue_key "$branch" || true)"
+  fi
+  [[ -n "$issue_key" ]] && issue_key="$(print -r -- "$issue_key" | tr '[:lower:]' '[:upper:]')"
+  [[ -n "$issue_key" && -n "$issue_browse_url" ]] && issue_url="$issue_browse_url/$issue_key"
+
+  print_plan "$branch" "$issue_key" "$verbose"
+  if [[ "$dry_run" == "true" ]]; then
+    print -- "Dry run: nothing queued."
+    return
+  fi
+
+  if [[ "$comments" == "true" && "$issue_enabled" == "true" && -z "$issue_key" ]]; then
+    note "No issue key found; completion comments are disabled. Use --issue KEY."
+    comments="false"
+  fi
+  [[ "$issue_enabled" == "true" ]] || comments="false"
+
+  load_jenkins_token
+  [[ "$comments" == "true" ]] && load_issue_token
+  load_runtime
+  prepare_jenkins_session
+
+  local index failures=0
+  local -a queue_urls=() parameters=()
+  for (( index = 1; index <= ${#job_labels[@]}; index += 1 )); do
+    parameters=("${(@f)$(build_parameters "$index" "$branch" "$issue_url")}")
+    note "Queueing ${job_labels[$index]}…"
+    queue_urls[$index]="$(trigger_build "$index" "${parameters[@]}")" || {
+      queue_urls[$index]=""
+      (( failures += 1 ))
+    }
+  done
+
+  wait_for_starts "${queue_urls[@]}" || (( failures += 1 ))
+  print
+  print -- "Started:"
+  for (( index = 1; index <= ${#job_labels[@]}; index += 1 )); do
+    [[ -n "${pipeline_urls[$index]:-}" ]] && print -- "  ${job_labels[$index]}: ${pipeline_urls[$index]}"
+  done
+  (( failures == 0 )) || fail "Some jobs did not start"
+
+  if [[ "$comments" == "true" ]]; then
+    start_watchers "$branch" "$issue_key"
+  fi
+  cleanup
+}
+
+run_command() {
+  local dry_run="false" comments="true" verbose="false" issue_override=""
+  local -a targets=()
+  while (( $# > 0 )); do
+    case "$1" in
+      -n|--dry-run) dry_run="true"; shift ;;
+      --no-comment) comments="false"; shift ;;
+      -v|--verbose) verbose="true"; shift ;;
+      -i|--issue)
+        (( $# >= 2 )) || fail "--issue needs a key"
+        issue_override="$2"
+        shift 2
+        ;;
+      -h|--help) help_run; return ;;
+      --*) fail "Unknown option: $1" ;;
+      *) targets+=("$1"); shift ;;
+    esac
+  done
+  (( ${#targets[@]} > 0 )) || targets=("")
+  (( ${#targets[@]} == 1 )) || [[ -z "$issue_override" ]] \
+    || fail "--issue can only be used with one target"
+  local target
+  for target in "${targets[@]}"; do
+    run_one "$target" "$issue_override" "$dry_run" "$comments" "$verbose"
+  done
+}
+
+find_cancelable_builds() {
+  local branch="$1"
+  local output_file="$2"
+  local queue_body="$runtime_dir/cancel-queue.json"
+  local http_code index job_url running_body
+  : > "$output_file"
+  http_code="$(api_get "$jenkins_url/queue/api/json?tree=items[id,url,task[name,url],actions[parameters[name,value]]]" "$queue_body")" \
+    || fail "Could not read the Jenkins queue"
+  [[ "$http_code" == "200" ]] || fail "Could not read the Jenkins queue (HTTP $http_code)"
+
+  for (( index = 1; index <= ${#job_labels[@]}; index += 1 )); do
+    job_url="$(job_api_url "${job_paths[$index]}")"
+    jq -r \
+      --arg branch "$branch" \
+      --arg parameter "$branch_parameter" \
+      --arg jobUrl "$job_url" \
+      --arg label "${job_labels[$index]}" '
+        def parameter($name):
+          ([.actions[]?.parameters[]? | select(.name == $name) | .value][0] // "");
+        .items[]
+        | select(((.task.url // "") | rtrimstr("/")) == ($jobUrl | rtrimstr("/")))
+        | select((parameter($parameter) | tostring) == $branch)
+        | ["queue", (.id | tostring), $label, (.url // "")]
+        | @tsv
+      ' "$queue_body" >> "$output_file"
+
+    running_body="$runtime_dir/cancel-running-$index.json"
+    http_code="$(api_get "$job_url/api/json?tree=builds[number,url,building,result,actions[parameters[name,value]]]{0,50}" "$running_body")" \
+      || fail "Could not read ${job_labels[$index]}"
+    [[ "$http_code" == "200" ]] || fail "Could not read ${job_labels[$index]} (HTTP $http_code)"
+    jq -r \
+      --arg branch "$branch" \
+      --arg parameter "$branch_parameter" \
+      --arg label "${job_labels[$index]}" '
+        def parameter($name):
+          ([.actions[]?.parameters[]? | select(.name == $name) | .value][0] // "");
+        .builds[]
+        | select(.building == true)
+        | select((parameter($parameter) | tostring) == $branch)
+        | ["running", (.number | tostring), $label, .url]
+        | @tsv
+      ' "$running_body" >> "$output_file"
+  done
+}
+
+cancel_one() {
+  local target="$1"
+  local dry_run="$2"
+  local assume_yes="$3"
+  [[ -n "$branch_parameter" ]] || fail "Cancel requires repository.branchParameter"
+  local branch matches kind identifier label url answer http_code index=0 failures=0
+  branch="$(resolve_branch "$target")"
+  load_jenkins_token
+  load_runtime
+  prepare_jenkins_session
+  matches="$runtime_dir/cancel.tsv"
+  find_cancelable_builds "$branch" "$matches"
+  if [[ ! -s "$matches" ]]; then
+    print -- "No queued or running builds for: $branch"
+    cleanup
+    return
+  fi
+  print -- "Matches for $branch:"
+  while IFS=$'\t' read -r kind identifier label url; do
+    print -- "  $kind: $label #$identifier $url"
+  done < "$matches"
+  if [[ "$dry_run" == "true" ]]; then
+    print -- "Dry run: nothing cancelled."
+    cleanup
+    return
+  fi
+  if [[ "$assume_yes" != "true" ]]; then
+    [[ -t 0 ]] || fail "Use --yes for non-interactive cancellation"
+    read "answer?Cancel these builds? [y/N]: "
+    case "$answer" in
+      y|Y|yes|YES) ;;
+      *) print -- "Cancelled by user."; cleanup; return ;;
+    esac
+  fi
+  while IFS=$'\t' read -r kind identifier label url; do
+    (( index += 1 ))
+    if [[ "$kind" == "queue" ]]; then
+      http_code="$(api_post "$jenkins_url/queue/cancelItem" "$runtime_dir/cancel-$index.body" "id=$identifier")" || http_code="000"
+    else
+      http_code="$(api_post "${url%/}/stop" "$runtime_dir/cancel-$index.body")" || http_code="000"
+    fi
+    case "$http_code" in
+      200|201|302) print -- "  Cancelled: $label #$identifier" ;;
+      *) note "Could not cancel $label #$identifier (HTTP $http_code)"; (( failures += 1 )) ;;
+    esac
+  done < "$matches"
+  cleanup
+  (( failures == 0 )) || fail "$failures cancellations failed"
+}
+
+cancel_command() {
+  local dry_run="false" assume_yes="false"
+  local -a targets=()
+  while (( $# > 0 )); do
+    case "$1" in
+      -n|--dry-run) dry_run="true"; shift ;;
+      -y|--yes) assume_yes="true"; shift ;;
+      -h|--help) help_cancel; return ;;
+      --*) fail "Unknown option: $1" ;;
+      *) targets+=("$1"); shift ;;
+    esac
+  done
+  (( ${#targets[@]} > 0 )) || targets=("")
+  local target
+  for target in "${targets[@]}"; do
+    cancel_one "$target" "$dry_run" "$assume_yes"
+  done
+}
+
+build_result() {
+  local build_url="$1"
+  local index="$2"
+  local body="$runtime_dir/build-$index.json"
+  local http_code building result
+  http_code="$(api_get "${build_url%/}/api/json?tree=building,result,url" "$body")" || return 4
+  [[ "$http_code" == "200" ]] || return 4
+  building="$(jq -r '.building // false' "$body" 2>/dev/null)" || return 4
+  [[ "$building" == "true" ]] && return 3
+  result="$(jq -r '.result // "UNKNOWN"' "$body" 2>/dev/null)" || return 4
+  print -r -- "$result"
+}
+
+wait_for_build_result() {
+  local index="$1"
+  local build_url="$2"
+  local elapsed=0 api_failures=0 result result_status
+  while (( elapsed < build_timeout )); do
+    result="$(build_result "$build_url" "$index")"
+    result_status=$?
+    case "$result_status" in
+      0) print -r -- "$result"; return ;;
+      3) api_failures=0 ;;
+      *)
+        (( api_failures += 1 ))
+        (( api_failures < 10 )) || { print -r -- "API_ERROR"; return; }
+        ;;
+    esac
+    sleep "$poll_interval"
+    (( elapsed += poll_interval ))
+  done
+  print -r -- "TIMEOUT"
+}
+
+download_console() {
+  local build_url="$1"
+  local index="$2"
+  local output_file="$runtime_dir/console-$index.txt"
+  local http_code
+  http_code="$(api_get "${build_url%/}/consoleText" "$output_file")" || http_code="000"
+  [[ "$http_code" == "200" ]] || : > "$output_file"
+  print -r -- "$output_file"
+}
+
+artifact_links() {
+  local index="$1"
+  local console_file="$2"
+  local regex="${job_link_regexes[$index]}"
+  local label="${job_link_labels[$index]:-Artifact}"
+  local url output="" count=0
+  [[ -n "$regex" ]] || return
+  while IFS= read -r url; do
+    [[ -n "$url" ]] || continue
+    (( count += 1 ))
+    [[ -z "$output" ]] || output+=", "
+    output+="[$label$count|$url]"
+  done < <(grep -Eo -- "$regex" "$console_file" 2>/dev/null | awk '!seen[$0]++')
+  print -r -- "$output"
+}
+
+issue_auth_args() {
+  local auth_file="$runtime_dir/issue-auth.conf"
+  case "$issue_auth_mode" in
+    auto|basic) write_curl_auth_config "$auth_file" basic "$issue_user" "$issue_token" ;;
+    bearer) write_curl_auth_config "$auth_file" bearer "$issue_user" "$issue_token" ;;
+  esac
+  reply=(--config "$auth_file")
+}
+
+issue_request() {
+  local method="$1"
+  local url="$2"
+  local output_file="$3"
+  local payload="${4:-}"
+  local -a common auth
+  common=(
+    --silent --show-error --globoff
+    --connect-timeout 15 --max-time 60
+    --header "Accept: application/json"
+    --output "$output_file"
+    --write-out '%{http_code}'
+  )
+  [[ "$issue_insecure" == "true" ]] && common+=(--insecure)
+  [[ "$method" == "POST" ]] && common+=(--request POST --header "Content-Type: application/json" --data "$payload")
+  issue_auth_args
+  auth=("${reply[@]}")
+  curl "${common[@]}" "${auth[@]}" "$url"
+}
+
+issue_request_with_auto_fallback() {
+  local method="$1" url="$2" output_file="$3" payload="${4:-}"
+  local http_code
+  http_code="$(issue_request "$method" "$url" "$output_file" "$payload")" || return 1
+  if [[ "$issue_auth_mode" == "auto" && ( "$http_code" == "401" || "$http_code" == "403" ) ]]; then
+    local saved_mode="$issue_auth_mode"
+    issue_auth_mode="bearer"
+    http_code="$(issue_request "$method" "$url" "$output_file" "$payload")" || { issue_auth_mode="$saved_mode"; return 1; }
+    issue_auth_mode="$saved_mode"
+  fi
+  print -r -- "$http_code"
+}
+
+issue_comment_exists() {
+  local issue_key="$1" build_url="$2"
+  local output_file="$runtime_dir/issue-comments.json"
+  local http_code exists
+  http_code="$(issue_request_with_auto_fallback GET "$issue_api_url/issue/$issue_key/comment?maxResults=1000&orderBy=-created" "$output_file")" \
+    || return 2
+  [[ "$http_code" == "200" ]] || return 2
+  exists="$(jq -r --arg url "$build_url" 'any(.comments[]?; (.body // "") | contains($url))' "$output_file" 2>/dev/null)" \
+    || return 2
+  [[ "$exists" == "true" ]]
+}
+
+post_issue_comment() {
+  local issue_key="$1" comment="$2"
+  local output_file="$runtime_dir/issue-response.json"
+  local payload http_code
+  payload="$(jq -n --arg body "$comment" '{body: $body}')" || return 1
+  http_code="$(issue_request_with_auto_fallback POST "$issue_api_url/issue/$issue_key/comment" "$output_file" "$payload")" \
+    || return 1
+  [[ "$http_code" == "200" || "$http_code" == "201" ]]
+}
+
+watch_build() {
+  local launchd_label="$1" branch="$2" issue_key="$3" index="$4" build_url="$5"
+  watcher_label="$launchd_label"
+  load_config
+  load_jenkins_token
+  load_issue_token
+  load_runtime
+  local result console_file links details comment
+  result="$(wait_for_build_result "$index" "$build_url")"
+  if [[ "$result" != "SUCCESS" ]]; then
+    note "${job_labels[$index]}: $result; no comment posted"
+    launchctl remove "$launchd_label" >/dev/null 2>&1
+    return
+  fi
+  local comment_status
+  issue_comment_exists "$issue_key" "$build_url"
+  comment_status=$?
+  case "$comment_status" in
+    0)
+      note "${job_labels[$index]}: comment already exists"
+      launchctl remove "$launchd_label" >/dev/null 2>&1
+      return
+      ;;
+    1) ;;
+    *)
+      note "${job_labels[$index]}: could not check existing comments"
+      launchctl remove "$launchd_label" >/dev/null 2>&1
+      return 1
+      ;;
+  esac
+  console_file="$(download_console "$build_url" "$index")"
+  links="$(artifact_links "$index" "$console_file")"
+  details="[Jenkins|$build_url]"
+  [[ -n "$links" ]] && details="$links ([Jenkins|$build_url])"
+  comment="h3. Build — ${job_labels[$index]}"$'\n'"*Branch:* $branch"$'\n'"*Links:* $details"
+  post_issue_comment "$issue_key" "$comment" \
+    && note "${job_labels[$index]}: comment posted" \
+    || note "${job_labels[$index]}: comment failed"
+  launchctl remove "$launchd_label" >/dev/null 2>&1
+}
+
+start_watchers() {
+  local branch="$1" issue_key="$2"
+  mkdir -p "$log_dir" || fail "Could not create watcher log directory: $log_dir"
+  local timestamp index launchd_label log_file safe_key count=0
+  timestamp="$(date '+%Y%m%d-%H%M%S')"
+  safe_key="$(print -r -- "$issue_key" | tr '[:upper:]' '[:lower:]' | tr -cd '[:alnum:]._-')"
+  for (( index = 1; index <= ${#job_labels[@]}; index += 1 )); do
+    [[ -n "${pipeline_urls[$index]:-}" ]] || continue
+    launchd_label="io.github.heartsker.jenkins-batch.$safe_key.$index.$timestamp.$$"
+    log_file="$log_dir/$safe_key-job-$index-$timestamp-$$.log"
+    launchctl submit \
+      -l "$launchd_label" \
+      -o "$log_file" \
+      -e "$log_file" \
+      -- /usr/bin/env JENKINS_BATCH_CONFIG="$config_file" \
+      "$SCRIPT_PATH" __watch "$launchd_label" "$branch" "$issue_key" "$index" "${pipeline_urls[$index]}" \
+      || fail "Builds started, but a completion watcher could not start"
+    (( count += 1 ))
+  done
+  print -- "Watching $count builds. Logs: $log_dir"
+}
+
+main() {
+  local command="${1:-help}"
+  [[ $# -gt 0 ]] && shift
+  if [[ "$command" == "__watch" ]]; then
+    (( $# == 5 )) || fail "Invalid watcher invocation"
+    watch_build "$@"
+    return
+  fi
+
+  case "$command" in
+    setup) setup_command "$@" ;;
+    doctor) doctor "$@" ;;
+    config) config_command "$@" ;;
+    run) load_config; run_command "$@" ;;
+    cancel) load_config; cancel_command "$@" ;;
+    help|-h|--help) show_help "${1:-}" ;;
+    version|-V|--version) print -- "$APP_NAME $APP_VERSION" ;;
+    *)
+      # Backward-friendly shorthand: `jenkins-batch BRANCH`.
+      load_config
+      run_command "$command" "$@"
+      ;;
+  esac
+}
+
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+main "$@"

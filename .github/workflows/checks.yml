@@ -1,0 +1,38 @@
+name: Checks
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  smoke:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install jq
+        run: brew install jq
+      - name: Syntax
+        run: zsh -n bin/jenkins-batch
+      - name: CLI smoke test
+        run: |
+          bin/jenkins-batch version
+          bin/jenkins-batch help
+          smoke_dir="$(mktemp -d)"
+          mkdir -p "$smoke_dir/bin"
+          cat > "$smoke_dir/bin/security" <<'EOF'
+          #!/bin/sh
+          exit 0
+          EOF
+          chmod +x "$smoke_dir/bin/security"
+          printf 'ci-user\njenkins-token\njira-token\n' | \
+            PATH="$smoke_dir/bin:$PATH" \
+            JENKINS_BATCH_CONFIG="$smoke_dir/config.json" \
+            bin/jenkins-batch setup --config examples/config.example.json
+          jq -e '.jenkins.user == "ci-user" and .issueTracker.user == "ci-user"' \
+            "$smoke_dir/config.json"
+          PATH="$smoke_dir/bin:$PATH" \
+            JENKINS_BATCH_CONFIG="$smoke_dir/config.json" \
+            bin/jenkins-batch run feature/APP-123-demo --dry-run --verbose

@@ -1,0 +1,57 @@
+{
+  "version": 1,
+  "jenkins": {
+    "url": "https://jenkins.example.com",
+    "user": "{{user}}",
+    "tokenUrl": "https://jenkins.example.com/me/configure",
+    "insecure": false,
+    "queueTimeout": 1800,
+    "buildTimeout": 21600,
+    "pollInterval": 30
+  },
+  "repository": {
+    "path": "~/Projects/mobile-app",
+    "remote": "origin",
+    "branchOwner": "{{user}}",
+    "branchParameter": "sourceBranch",
+    "ticketPattern": "[[:alpha:]][[:alnum:]]*-[[:digit:]]+"
+  },
+  "issueTracker": {
+    "enabled": true,
+    "browseUrl": "https://jira.example.com/browse",
+    "apiUrl": "https://jira.example.com/rest/api/2",
+    "user": "{{user}}",
+    "tokenUrl": "https://jira.example.com/secure/ViewProfile.jspa",
+    "authMode": "auto",
+    "insecure": false,
+    "jobParameter": "ISSUE_URL"
+  },
+  "logDirectory": "~/Library/Logs/jenkins-batch",
+  "jobs": [
+    {
+      "label": "Simulator QA",
+      "path": "Mobile/Simulator",
+      "parameters": {
+        "BUILD_CONFIGURATION": "QA"
+      },
+      "linkLabel": "Artifact",
+      "linkRegex": "https://artifacts[.]example[.]com/[^[:space:]]+[.]zip"
+    },
+    {
+      "label": "Simulator Debug",
+      "path": "Mobile/Simulator",
+      "parameters": {
+        "BUILD_CONFIGURATION": "Debug"
+      },
+      "linkLabel": "Artifact",
+      "linkRegex": "https://artifacts[.]example[.]com/[^[:space:]]+[.]zip"
+    },
+    {
+      "label": "Device",
+      "path": "Mobile/Device",
+      "parameters": {},
+      "linkLabel": "Install",
+      "linkRegex": "https://install[.]example[.]com/builds/[[:alnum:]-]+"
+    }
+  ]
+}
