@@ -58,6 +58,26 @@ jobs:
           PATH="$smoke_dir/bin:$PATH" \
             JENKINS_BATCH_CONFIG="$smoke_dir/config.json" \
             bin/jenkins-batch run feature/APP-123-demo --all --dry-run
-          yes '' | PATH="$smoke_dir/bin:$PATH" \
+          cp "$smoke_dir/config.json" "$smoke_dir/before-wizard.json"
+          printf '1\nhttps://ci.example.com\nb\ny\n' | \
             JENKINS_BATCH_CONFIG="$smoke_dir/config.json" \
-            bin/jenkins-batch config wizard
+            bin/jenkins-batch config wizard jenkins
+          jq -e '
+            .jenkins.url == "https://ci.example.com" and
+            .jenkins.tokenUrl == "https://ci.example.com/me/configure" and
+            all(.jobs[]; .url | startswith("https://ci.example.com/job/"))
+          ' "$smoke_dir/config.json"
+          jq -e --slurp '
+            .[0] as $before | .[1] as $after |
+            ($before | del(.jenkins.url, .jenkins.tokenUrl, .jobs[].url)) ==
+            ($after | del(.jenkins.url, .jenkins.tokenUrl, .jobs[].url))
+          ' "$smoke_dir/before-wizard.json" "$smoke_dir/config.json"
+          cp "$smoke_dir/config.json" "$smoke_dir/before-job-wizard.json"
+          printf '1\n3\nb\nb\ny\n' | \
+            JENKINS_BATCH_CONFIG="$smoke_dir/config.json" \
+            bin/jenkins-batch config wizard jobs
+          jq -e '.jobs[0].enabledByDefault == false' "$smoke_dir/config.json"
+          jq -e --slurp '
+            .[0] as $before | .[1] as $after |
+            ($before | .jobs[0].enabledByDefault = false) == $after
+          ' "$smoke_dir/before-job-wizard.json" "$smoke_dir/config.json"

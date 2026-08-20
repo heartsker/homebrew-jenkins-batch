@@ -59,7 +59,12 @@ Edit it without opening JSON:
 
 ```sh
 jenkins-batch config wizard
+jenkins-batch config wizard jobs
+jenkins-batch config wizard jenkins
 ```
+
+The wizard edits one field or section at a time, shows a summary before saving,
+and can quit without changing the current config.
 
 Share [`examples/config.example.json`](examples/config.example.json) as a
 starting point. It must not contain tokens or passwords; setup rejects them.

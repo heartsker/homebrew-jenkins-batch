@@ -5,7 +5,7 @@ setopt PIPE_FAIL
 unsetopt BG_NICE
 
 readonly APP_NAME="jenkins-batch"
-readonly APP_VERSION="0.2.0"
+readonly APP_VERSION="0.3.0"
 readonly SCRIPT_PATH="${0:A}"
 readonly JENKINS_KEYCHAIN_SERVICE="io.github.heartsker.jenkins-batch.jenkins"
 readonly ISSUE_KEYCHAIN_SERVICE="io.github.heartsker.jenkins-batch.issue-tracker"
@@ -20,6 +20,10 @@ typeset -g jenkins_token=""
 typeset -g issue_token=""
 typeset -g watcher_label=""
 typeset -g credential_check_detail=""
+typeset -g ui_bold=""
+typeset -g ui_dim=""
+typeset -g ui_accent=""
+typeset -g ui_reset=""
 
 typeset -g jenkins_url=""
 typeset -g jenkins_user=""
@@ -64,6 +68,7 @@ Usage:
 
 Start:
   jenkins-batch setup --config team.json
+  jenkins-batch config wizard [jenkins|repository|issue|jobs|runtime]
   jenkins-batch run [--select|--job NAME|--all]
 
 More: jenkins-batch help <setup|run|cancel>
@@ -203,6 +208,34 @@ confirm() {
     y|Y|yes|YES) return 0 ;;
     *) return 1 ;;
   esac
+}
+
+init_ui() {
+  if [[ -t 1 && -z "${NO_COLOR:-}" ]]; then
+    ui_bold=$'\e[1m'
+    ui_dim=$'\e[2m'
+    ui_accent=$'\e[36m'
+    ui_reset=$'\e[0m'
+  fi
+}
+
+ui_title() {
+  print
+  print -- "${ui_bold}$1${ui_reset}"
+}
+
+ui_item() {
+  local key="$1"
+  local label="$2"
+  local value="${3:-}"
+  printf '  %s%-3s%s %-18s %s%s%s\n' \
+    "$ui_accent" "$key" "$ui_reset" "$label" "$ui_dim" "$value" "$ui_reset"
+}
+
+read_choice() {
+  local value=""
+  read "value?Select: "
+  print -r -- "$value"
 }
 
 prompt_secret() {
@@ -573,6 +606,10 @@ job_url_from_path() {
 
 setup_wizard() {
   local edit_mode="${1:-false}"
+  if [[ "$edit_mode" == "true" ]]; then
+    config_edit_wizard
+    return
+  fi
   command -v jq >/dev/null 2>&1 || fail "jq is required; install with: brew install jq"
   command -v security >/dev/null 2>&1 || fail "macOS Keychain is required"
 
@@ -816,6 +853,418 @@ setup_wizard() {
   print -- "Ready."
 }
 
+update_config_json() {
+  local file="$1"
+  local filter="$2"
+  shift 2
+  local next_file="${file}.next"
+  jq "$@" "$filter" "$file" > "$next_file" || {
+    rm -f -- "$next_file"
+    return 1
+  }
+  mv -f "$next_file" "$file"
+}
+
+save_wizard_config() {
+  local source_file="$1"
+  if cmp -s "$source_file" "$config_file"; then
+    print -- "No changes."
+    return
+  fi
+  validate_config_file "$source_file" || { note "Cannot save: invalid configuration"; return 1; }
+  config_contains_secrets "$source_file" && { note "Cannot save: config contains a secret"; return 1; }
+
+  local old_jenkins_user old_issue_user new_jenkins_user new_issue_user new_issue_enabled
+  old_jenkins_user="$(jq -r '.jenkins.user' "$config_file")"
+  old_issue_user="$(jq -r '.issueTracker.user // empty' "$config_file")"
+  new_jenkins_user="$(jq -r '.jenkins.user' "$source_file")"
+  new_issue_user="$(jq -r '.issueTracker.user // empty' "$source_file")"
+  new_issue_enabled="$(jq -r '.issueTracker.enabled // false' "$source_file")"
+
+  local config_dir temporary_config
+  config_dir="$(dirname "$config_file")"
+  mkdir -p "$config_dir" || fail "Could not create $config_dir"
+  temporary_config="$(mktemp "$config_dir/config.XXXXXX")" || fail "Could not create configuration"
+  jq . "$source_file" > "$temporary_config" || fail "Could not write configuration"
+  chmod 600 "$temporary_config"
+  mv -f "$temporary_config" "$config_file"
+  print -- "Saved."
+  [[ "$old_jenkins_user" == "$new_jenkins_user" ]] \
+    || print -- "Run: jenkins-batch setup --jenkins"
+  [[ "$new_issue_enabled" != "true" || "$old_issue_user" == "$new_issue_user" ]] \
+    || print -- "Run: jenkins-batch setup --issue"
+}
+
+edit_jenkins_menu() {
+  local file="$1"
+  local choice value old_url new_url token_url index job_count job_path_value job_url
+  while true; do
+    ui_title "Jenkins"
+    ui_item 1 "URL" "$(jq -r '.jenkins.url' "$file")"
+    ui_item 2 "Username" "$(jq -r '.jenkins.user' "$file")"
+    ui_item 3 "Token page" "$(jq -r '.jenkins.tokenUrl // empty' "$file")"
+    value="verified"
+    [[ "$(jq -r '.jenkins.insecure // false' "$file")" == "true" ]] && value="disabled"
+    ui_item 4 "TLS verification" "$value"
+    ui_item b "Back"
+    choice="$(read_choice)"
+    case "$choice" in
+      1)
+        old_url="$(jq -r '.jenkins.url' "$file")"
+        new_url="$(prompt_required "Jenkins URL" "$old_url")"
+        new_url="${new_url%/}"
+        if [[ "$new_url" != "$old_url" ]]; then
+          token_url="$(jq -r '.jenkins.tokenUrl // empty' "$file")"
+          update_config_json "$file" '.jenkins.url = $value' --arg value "$new_url" || fail "Could not update Jenkins URL"
+          if [[ -z "$token_url" || "$token_url" == "${old_url%/}/me/configure" ]]; then
+            update_config_json "$file" '.jenkins.tokenUrl = $value' --arg value "$new_url/me/configure" \
+              || fail "Could not update token URL"
+          fi
+          job_count="$(jq -r '.jobs | length' "$file")"
+          for (( index = 0; index < job_count; index += 1 )); do
+            job_path_value="$(jq -r ".jobs[$index].path" "$file")"
+            job_url="$(job_url_from_path "$new_url" "$job_path_value")"
+            update_config_json "$file" ".jobs[$index].url = \$value" --arg value "$job_url" \
+              || fail "Could not update job URL"
+          done
+        fi
+        ;;
+      2)
+        value="$(prompt_required "Jenkins username" "$(jq -r '.jenkins.user' "$file")")"
+        update_config_json "$file" '.jenkins.user = $value' --arg value "$value" || fail "Could not update username"
+        ;;
+      3)
+        value="$(prompt "Jenkins token URL" "$(jq -r '.jenkins.tokenUrl // empty' "$file")")"
+        update_config_json "$file" '.jenkins.tokenUrl = $value' --arg value "$value" || fail "Could not update token URL"
+        ;;
+      4)
+        update_config_json "$file" '.jenkins.insecure = ((.jenkins.insecure // false) | not)' \
+          || fail "Could not update TLS setting"
+        ;;
+      b|B|q|Q) return ;;
+      *) note "Unknown choice" ;;
+    esac
+  done
+}
+
+edit_repository_menu() {
+  local file="$1"
+  local choice value
+  while true; do
+    ui_title "Repository"
+    ui_item 1 "Local path" "$(jq -r '.repository.path' "$file")"
+    ui_item 2 "Git remote" "$(jq -r '.repository.remote // "origin"' "$file")"
+    ui_item 3 "Branch owner" "$(jq -r '.repository.branchOwner // empty' "$file")"
+    ui_item 4 "Branch parameter" "$(jq -r '.repository.branchParameter // empty' "$file")"
+    ui_item 5 "Issue key regex" "$(jq -r '.repository.ticketPattern // empty' "$file")"
+    ui_item b "Back"
+    choice="$(read_choice)"
+    case "$choice" in
+      1)
+        value="$(prompt_required "Local repository" "$(jq -r '.repository.path' "$file")")"
+        update_config_json "$file" '.repository.path = $value' --arg value "$value" || fail "Could not update repository"
+        ;;
+      2)
+        value="$(prompt_required "Git remote" "$(jq -r '.repository.remote // "origin"' "$file")")"
+        update_config_json "$file" '.repository.remote = $value' --arg value "$value" || fail "Could not update remote"
+        ;;
+      3)
+        value="$(prompt "Remote branch namespace" "$(jq -r '.repository.branchOwner // empty' "$file")")"
+        update_config_json "$file" '.repository.branchOwner = $value' --arg value "$value" || fail "Could not update branch owner"
+        ;;
+      4)
+        value="$(prompt "Jenkins branch parameter" "$(jq -r '.repository.branchParameter // empty' "$file")")"
+        update_config_json "$file" '.repository.branchParameter = $value' --arg value "$value" || fail "Could not update branch parameter"
+        ;;
+      5)
+        value="$(prompt_required "Issue key regex" "$(jq -r '.repository.ticketPattern // empty' "$file")")"
+        update_config_json "$file" '.repository.ticketPattern = $value' --arg value "$value" || fail "Could not update issue regex"
+        ;;
+      b|B|q|Q) return ;;
+      *) note "Unknown choice" ;;
+    esac
+  done
+}
+
+edit_issue_menu() {
+  local file="$1"
+  local choice value state
+  while true; do
+    state="disabled"
+    [[ "$(jq -r '.issueTracker.enabled // false' "$file")" == "true" ]] && state="enabled"
+    ui_title "Issue tracker"
+    ui_item 1 "Integration" "$state"
+    ui_item 2 "Browse URL" "$(jq -r '.issueTracker.browseUrl // empty' "$file")"
+    ui_item 3 "API URL" "$(jq -r '.issueTracker.apiUrl // empty' "$file")"
+    ui_item 4 "Username" "$(jq -r '.issueTracker.user // empty' "$file")"
+    ui_item 5 "Token page" "$(jq -r '.issueTracker.tokenUrl // empty' "$file")"
+    ui_item 6 "Auth mode" "$(jq -r '.issueTracker.authMode // "auto"' "$file")"
+    ui_item 7 "Job parameter" "$(jq -r '.issueTracker.jobParameter // empty' "$file")"
+    state="verified"
+    [[ "$(jq -r '.issueTracker.insecure // false' "$file")" == "true" ]] && state="disabled"
+    ui_item 8 "TLS verification" "$state"
+    ui_item b "Back"
+    choice="$(read_choice)"
+    case "$choice" in
+      1) update_config_json "$file" '.issueTracker.enabled = ((.issueTracker.enabled // false) | not)' || fail "Could not update integration" ;;
+      2)
+        value="$(prompt "Issue browse URL" "$(jq -r '.issueTracker.browseUrl // empty' "$file")")"
+        value="${value%/}"
+        update_config_json "$file" '.issueTracker.browseUrl = $value' --arg value "$value" || fail "Could not update browse URL"
+        ;;
+      3)
+        value="$(prompt "Issue API URL" "$(jq -r '.issueTracker.apiUrl // empty' "$file")")"
+        value="${value%/}"
+        update_config_json "$file" '.issueTracker.apiUrl = $value' --arg value "$value" || fail "Could not update API URL"
+        ;;
+      4)
+        value="$(prompt "Issue tracker username" "$(jq -r '.issueTracker.user // empty' "$file")")"
+        update_config_json "$file" '.issueTracker.user = $value' --arg value "$value" || fail "Could not update username"
+        ;;
+      5)
+        value="$(prompt "Issue token URL" "$(jq -r '.issueTracker.tokenUrl // empty' "$file")")"
+        update_config_json "$file" '.issueTracker.tokenUrl = $value' --arg value "$value" || fail "Could not update token URL"
+        ;;
+      6)
+        value="$(prompt "Authentication mode (auto, basic, bearer)" "$(jq -r '.issueTracker.authMode // "auto"' "$file")")"
+        case "$value" in auto|basic|bearer) ;; *) note "Use auto, basic, or bearer"; continue ;; esac
+        update_config_json "$file" '.issueTracker.authMode = $value' --arg value "$value" || fail "Could not update auth mode"
+        ;;
+      7)
+        value="$(prompt "Jenkins issue URL parameter" "$(jq -r '.issueTracker.jobParameter // empty' "$file")")"
+        update_config_json "$file" '.issueTracker.jobParameter = $value' --arg value "$value" || fail "Could not update job parameter"
+        ;;
+      8) update_config_json "$file" '.issueTracker.insecure = ((.issueTracker.insecure // false) | not)' || fail "Could not update TLS setting" ;;
+      b|B|q|Q) return ;;
+      *) note "Unknown choice" ;;
+    esac
+  done
+}
+
+edit_runtime_menu() {
+  local file="$1"
+  local choice value
+  while true; do
+    ui_title "Runtime"
+    ui_item 1 "Queue timeout" "$(jq -r '.jenkins.queueTimeout // 1800' "$file")s"
+    ui_item 2 "Build timeout" "$(jq -r '.jenkins.buildTimeout // 21600' "$file")s"
+    ui_item 3 "Poll interval" "$(jq -r '.jenkins.pollInterval // 30' "$file")s"
+    ui_item 4 "Log directory" "$(jq -r '.logDirectory // "~/Library/Logs/jenkins-batch"' "$file")"
+    ui_item b "Back"
+    choice="$(read_choice)"
+    case "$choice" in
+      1|2|3)
+        local field label current
+        case "$choice" in
+          1) field="queueTimeout"; label="Queue timeout" ;;
+          2) field="buildTimeout"; label="Build timeout" ;;
+          3) field="pollInterval"; label="Poll interval" ;;
+        esac
+        current="$(jq -r ".jenkins.$field" "$file")"
+        value="$(prompt "$label in seconds" "$current")"
+        case "$value" in ''|*[!0-9]*) note "Use a positive integer"; continue ;; esac
+        (( value > 0 )) || { note "Use a positive integer"; continue; }
+        update_config_json "$file" ".jenkins.$field = \$value" --argjson value "$value" || fail "Could not update runtime"
+        ;;
+      4)
+        value="$(prompt_required "Watcher log directory" "$(jq -r '.logDirectory // "~/Library/Logs/jenkins-batch"' "$file")")"
+        update_config_json "$file" '.logDirectory = $value' --arg value "$value" || fail "Could not update log directory"
+        ;;
+      b|B|q|Q) return ;;
+      *) note "Unknown choice" ;;
+    esac
+  done
+}
+
+add_job_wizard() {
+  local file="$1"
+  local count label job_input job_path_value job_url enabled="false"
+  count="$(jq -r '.jobs | length' "$file")"
+  ui_title "Add job"
+  label="$(prompt_required "Name" "Job $(( count + 1 ))")"
+  job_input="$(prompt_required "Jenkins job URL")"
+  job_path_value="$(job_path_from_input "$job_input" "$(jq -r '.jenkins.url' "$file")")" || return 1
+  job_url="$(job_url_from_path "$(jq -r '.jenkins.url' "$file")" "$job_path_value")"
+  confirm "Enabled by default?" "yes" && enabled="true"
+  update_config_json "$file" '.jobs += [{label: $label, path: $path, url: $url, enabledByDefault: $enabled, parameters: {}, linkLabel: "", linkRegex: ""}]' \
+    --arg label "$label" --arg path "$job_path_value" --arg url "$job_url" --argjson enabled "$enabled" \
+    || fail "Could not add job"
+}
+
+edit_job_menu() {
+  local file="$1"
+  local index="$2"
+  local config_index=$(( index - 1 ))
+  local choice value job_input job_path_value job_url current enabled parameters regex label count
+  while true; do
+    count="$(jq -r '.jobs | length' "$file")"
+    (( index <= count )) || return
+    label="$(jq -r ".jobs[$config_index].label" "$file")"
+    enabled="$(jq -r ".jobs[$config_index] | if has(\"enabledByDefault\") then .enabledByDefault else true end" "$file")"
+    ui_title "Job · $label"
+    ui_item 1 "Name" "$label"
+    ui_item 2 "Jenkins URL" "$(jq -r ".jobs[$config_index].url // empty" "$file")"
+    ui_item 3 "Default" "$([[ "$enabled" == "true" ]] && print enabled || print optional)"
+    parameters="$(jq -r ".jobs[$config_index].parameters // {} | to_entries | map(.key + \"=\" + (.value | tostring)) | join(\",\")" "$file")"
+    ui_item 4 "Parameters" "${parameters:-none}"
+    regex="$(jq -r ".jobs[$config_index].linkRegex // empty" "$file")"
+    ui_item 5 "Result link" "${regex:-disabled}"
+    ui_item d "Delete"
+    ui_item b "Back"
+    choice="$(read_choice)"
+    case "$choice" in
+      1)
+        value="$(prompt_required "Name" "$label")"
+        update_config_json "$file" ".jobs[$config_index].label = \$value" --arg value "$value" || fail "Could not update job"
+        ;;
+      2)
+        current="$(jq -r ".jobs[$config_index].url // empty" "$file")"
+        [[ -n "$current" ]] || current="$(job_url_from_path "$(jq -r '.jenkins.url' "$file")" "$(jq -r ".jobs[$config_index].path" "$file")")"
+        job_input="$(prompt_required "Jenkins job URL" "$current")"
+        job_path_value="$(job_path_from_input "$job_input" "$(jq -r '.jenkins.url' "$file")")" || continue
+        job_url="$(job_url_from_path "$(jq -r '.jenkins.url' "$file")" "$job_path_value")"
+        update_config_json "$file" ".jobs[$config_index].path = \$path | .jobs[$config_index].url = \$url" \
+          --arg path "$job_path_value" --arg url "$job_url" || fail "Could not update job URL"
+        ;;
+      3)
+        update_config_json "$file" ".jobs[$config_index] |= (if has(\"enabledByDefault\") then .enabledByDefault = (.enabledByDefault | not) else .enabledByDefault = false end)" \
+          || fail "Could not update default state"
+        ;;
+      4)
+        value="$(prompt "Parameters (KEY=value, comma-separated)" "$parameters")"
+        parameters="$(parameters_json "$value")" || continue
+        update_config_json "$file" ".jobs[$config_index].parameters = \$value" --argjson value "$parameters" \
+          || fail "Could not update parameters"
+        ;;
+      5)
+        regex="$(prompt "Artifact URL regex (empty disables)" "$regex")"
+        value=""
+        [[ -n "$regex" ]] && value="$(prompt "Artifact link label" "$(jq -r ".jobs[$config_index].linkLabel // \"Artifact\"" "$file")")"
+        update_config_json "$file" ".jobs[$config_index].linkRegex = \$regex | .jobs[$config_index].linkLabel = \$label" \
+          --arg regex "$regex" --arg label "$value" || fail "Could not update result link"
+        ;;
+      d|D)
+        (( count > 1 )) || { note "At least one job is required"; continue; }
+        if confirm "Delete $label?" "no"; then
+          update_config_json "$file" "del(.jobs[$config_index])" || fail "Could not delete job"
+          return
+        fi
+        ;;
+      b|B|q|Q) return ;;
+      *) note "Unknown choice" ;;
+    esac
+  done
+}
+
+edit_jobs_menu() {
+  local file="$1"
+  local choice count index label enabled url
+  while true; do
+    count="$(jq -r '.jobs | length' "$file")"
+    ui_title "Jobs"
+    for (( index = 1; index <= count; index += 1 )); do
+      label="$(jq -r ".jobs[$(( index - 1 ))].label" "$file")"
+      enabled="$(jq -r ".jobs[$(( index - 1 ))] | if has(\"enabledByDefault\") then .enabledByDefault else true end" "$file")"
+      ui_item "$index" "$label" "$([[ "$enabled" == "true" ]] && print default || print optional)"
+      url="$(jq -r ".jobs[$(( index - 1 ))].url // empty" "$file")"
+      [[ -n "$url" ]] && print -- "      ${ui_dim}$url${ui_reset}"
+    done
+    ui_item a "Add job"
+    ui_item b "Back"
+    choice="$(read_choice)"
+    case "$choice" in
+      a|A) add_job_wizard "$file" ;;
+      b|B|q|Q) return ;;
+      ''|*[!0-9]*) note "Unknown choice" ;;
+      *)
+        (( choice >= 1 && choice <= count )) && edit_job_menu "$file" "$choice" || note "Unknown job"
+        ;;
+    esac
+  done
+}
+
+run_config_section() {
+  local section="$1"
+  local file="$2"
+  case "$section" in
+    jenkins) edit_jenkins_menu "$file" ;;
+    repository|repo) edit_repository_menu "$file" ;;
+    issue|jira) edit_issue_menu "$file" ;;
+    jobs|job) edit_jobs_menu "$file" ;;
+    runtime) edit_runtime_menu "$file" ;;
+    *) fail "Unknown config section: $section" ;;
+  esac
+}
+
+config_edit_wizard() {
+  local initial_section="${1:-}"
+  command -v jq >/dev/null 2>&1 || fail "jq is required; install with: brew install jq"
+  [[ -f "$config_file" ]] || fail "Not configured. Run: jenkins-batch setup"
+  validate_config_file "$config_file" || fail "Invalid configuration: $config_file"
+  init_ui
+
+  local wizard_dir working choice job_count default_count issue_state
+  wizard_dir="$(mktemp -d "${TMPDIR:-/tmp}/jenkins-batch-config.XXXXXX")" \
+    || fail "Could not create temporary configuration"
+  working="$wizard_dir/config.json"
+  jq . "$config_file" > "$working" || fail "Could not read configuration"
+
+  if [[ -n "$initial_section" ]]; then
+    run_config_section "$initial_section" "$working"
+    if cmp -s "$working" "$config_file"; then
+      print -- "No changes."
+      rm -rf -- "$wizard_dir"
+      return
+    fi
+    if confirm "Save changes?" "yes"; then
+      save_wizard_config "$working"
+    else
+      print -- "Not saved."
+    fi
+    rm -rf -- "$wizard_dir"
+    return
+  fi
+
+  while true; do
+    job_count="$(jq -r '.jobs | length' "$working")"
+    default_count="$(jq -r '[.jobs[] | select((if has("enabledByDefault") then .enabledByDefault else true end) == true)] | length' "$working")"
+    issue_state="disabled"
+    [[ "$(jq -r '.issueTracker.enabled // false' "$working")" == "true" ]] && issue_state="enabled"
+    ui_title "Config wizard"
+    ui_item 1 "Jenkins" "$(jq -r '.jenkins.url' "$working")"
+    ui_item 2 "Repository" "$(jq -r '.repository.path' "$working")"
+    ui_item 3 "Issue tracker" "$issue_state"
+    ui_item 4 "Jobs" "$job_count total · $default_count default"
+    ui_item 5 "Runtime" "poll $(jq -r '.jenkins.pollInterval // 30' "$working")s"
+    ui_item s "Save & exit"
+    ui_item q "Quit"
+    choice="$(read_choice)"
+    case "$choice" in
+      1) edit_jenkins_menu "$working" ;;
+      2) edit_repository_menu "$working" ;;
+      3) edit_issue_menu "$working" ;;
+      4) edit_jobs_menu "$working" ;;
+      5) edit_runtime_menu "$working" ;;
+      s|S)
+        save_wizard_config "$working" && { rm -rf -- "$wizard_dir"; return; }
+        ;;
+      q|Q)
+        if cmp -s "$working" "$config_file"; then
+          print -- "No changes."
+          rm -rf -- "$wizard_dir"
+          return
+        fi
+        if confirm "Discard changes?" "no"; then
+          print -- "Changes discarded."
+          rm -rf -- "$wizard_dir"
+          return
+        fi
+        ;;
+      *) note "Unknown choice" ;;
+    esac
+  done
+}
+
 validate_integer() {
   local name="$1"
   local value="$2"
@@ -972,7 +1421,7 @@ config_command() {
       [[ -f "$config_file" ]] || fail "Not configured. Run: jenkins-batch setup"
       "${EDITOR:-vi}" "$config_file"
       ;;
-    wizard) setup_wizard true ;;
+    wizard) config_edit_wizard "${2:-}" ;;
     *) fail "Usage: jenkins-batch config <path|show|edit|wizard>" ;;
   esac
 }
