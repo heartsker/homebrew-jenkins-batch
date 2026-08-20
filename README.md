@@ -26,6 +26,9 @@ Without a shared config:
 jenkins-batch setup
 ```
 
+`run` starts this wizard automatically when no config exists. Each job has a
+name, Jenkins URL, parameters, and a default-enabled flag.
+
 Replace one token:
 
 ```sh
@@ -37,6 +40,10 @@ jenkins-batch setup --issue
 
 ```sh
 jenkins-batch run
+jenkins-batch run --select
+jenkins-batch run --job "Simulator QA"
+jenkins-batch run --all
+jenkins-batch jobs
 jenkins-batch run APP-123
 jenkins-batch cancel APP-123 --dry-run
 jenkins-batch doctor
@@ -46,6 +53,12 @@ jenkins-batch doctor
 
 ```text
 ~/.config/jenkins-batch/config.json
+```
+
+Edit it without opening JSON:
+
+```sh
+jenkins-batch config wizard
 ```
 
 Share [`examples/config.example.json`](examples/config.example.json) as a

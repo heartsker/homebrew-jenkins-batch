@@ -48,4 +48,16 @@ jobs:
             "$smoke_dir/config.json"
           PATH="$smoke_dir/bin:$PATH" \
             JENKINS_BATCH_CONFIG="$smoke_dir/config.json" \
+            bin/jenkins-batch jobs
+          PATH="$smoke_dir/bin:$PATH" \
+            JENKINS_BATCH_CONFIG="$smoke_dir/config.json" \
             bin/jenkins-batch run feature/APP-123-demo --dry-run --verbose
+          PATH="$smoke_dir/bin:$PATH" \
+            JENKINS_BATCH_CONFIG="$smoke_dir/config.json" \
+            bin/jenkins-batch run feature/APP-123-demo --job Device --dry-run
+          PATH="$smoke_dir/bin:$PATH" \
+            JENKINS_BATCH_CONFIG="$smoke_dir/config.json" \
+            bin/jenkins-batch run feature/APP-123-demo --all --dry-run
+          yes '' | PATH="$smoke_dir/bin:$PATH" \
+            JENKINS_BATCH_CONFIG="$smoke_dir/config.json" \
+            bin/jenkins-batch config wizard

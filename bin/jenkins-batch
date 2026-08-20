@@ -5,7 +5,7 @@ setopt PIPE_FAIL
 unsetopt BG_NICE
 
 readonly APP_NAME="jenkins-batch"
-readonly APP_VERSION="0.1.1"
+readonly APP_VERSION="0.2.0"
 readonly SCRIPT_PATH="${0:A}"
 readonly JENKINS_KEYCHAIN_SERVICE="io.github.heartsker.jenkins-batch.jenkins"
 readonly ISSUE_KEYCHAIN_SERVICE="io.github.heartsker.jenkins-batch.issue-tracker"
@@ -46,6 +46,8 @@ typeset -ga job_paths=()
 typeset -ga job_parameters=()
 typeset -ga job_link_labels=()
 typeset -ga job_link_regexes=()
+typeset -ga job_enabled_defaults=()
+typeset -ga job_config_indices=()
 typeset -ga pipeline_urls=()
 
 help_main() {
@@ -53,15 +55,16 @@ help_main() {
 jenkins-batch — launch a configured group of Jenkins jobs.
 
 Usage:
-  jenkins-batch setup [--config FILE|--jenkins|--issue]
+  jenkins-batch setup [--config FILE|--edit|--jenkins|--issue]
   jenkins-batch run [TARGET ...] [options]
   jenkins-batch cancel [TARGET ...] [options]
+  jenkins-batch jobs
   jenkins-batch doctor
-  jenkins-batch config <path|show|edit>
+  jenkins-batch config <path|show|edit|wizard>
 
 Start:
   jenkins-batch setup --config team.json
-  jenkins-batch run
+  jenkins-batch run [--select|--job NAME|--all]
 
 More: jenkins-batch help <setup|run|cancel>
 HELP
@@ -69,11 +72,12 @@ HELP
 
 help_setup() {
   cat <<'HELP'
-jenkins-batch setup [--config FILE|--jenkins|--issue]
+jenkins-batch setup [--config FILE|--edit|--jenkins|--issue]
 
 Without FILE: interactive wizard.
 With FILE: import settings, then ask only for identity (if missing) and tokens.
 --jenkins or --issue: replace one saved token.
+--edit: update the config in a wizard.
 
   jenkins-batch setup --config team.json
 
@@ -86,7 +90,7 @@ help_run() {
   cat <<'HELP'
 jenkins-batch run [TARGET ...] [options]
 
-Queues every configured job, waits until each leaves the Jenkins queue, prints
+Queues selected jobs, waits until each leaves the Jenkins queue, prints
 the build URLs, then exits. If issue comments are enabled, small background
 watchers post one comment for each successful build.
 
@@ -94,6 +98,9 @@ Examples:
   jenkins-batch run
   jenkins-batch run feature/APP-123-new-flow
   jenkins-batch run APP-123 APP-124
+  jenkins-batch run --select
+  jenkins-batch run --job "Simulator QA" --job Device
+  jenkins-batch run --all
   jenkins-batch run APP-123 --dry-run --verbose
   jenkins-batch run feature/no-ticket --issue APP-123
 HELP
@@ -265,6 +272,7 @@ config_contains_secrets() {
 validate_config_file() {
   local file="$1"
   jq -e '
+    . as $config |
     .version == 1 and
     (.jenkins | type == "object") and
     (.jenkins.url | type == "string" and length > 0) and
@@ -299,6 +307,9 @@ validate_config_file() {
     all(.jobs[];
       (.label | type == "string" and length > 0) and
       (.path | type == "string" and length > 0) and
+      ((.url // "") | type == "string") and
+      (((.url // "") == "") or ((.url // "") | startswith((($config.jenkins.url | rtrimstr("/")) + "/job/")))) and
+      ((if has("enabledByDefault") then .enabledByDefault else true end) | type == "boolean") and
       ((.parameters // {}) | type == "object") and
       ((.linkLabel // "") | type == "string") and
       ((.linkRegex // "") | type == "string")
@@ -481,6 +492,7 @@ setup_from_config() {
 setup_command() {
   local source_file=""
   local credential_target=""
+  local edit_mode="false"
   while (( $# > 0 )); do
     case "$1" in
       --config)
@@ -493,6 +505,10 @@ setup_command() {
         credential_target="${1#--}"
         shift
         ;;
+      --edit)
+        edit_mode="true"
+        shift
+        ;;
       -h|--help) help_setup; return ;;
       --*) fail "Unknown option: $1" ;;
       *)
@@ -503,10 +519,14 @@ setup_command() {
     esac
   done
 
-  [[ -z "$source_file" || -z "$credential_target" ]] \
-    || fail "--config cannot be combined with --$credential_target"
+  [[ -z "$source_file" || ( -z "$credential_target" && "$edit_mode" != "true" ) ]] \
+    || fail "--config cannot be combined with another setup mode"
+  [[ -z "$credential_target" || "$edit_mode" != "true" ]] \
+    || fail "--edit cannot be combined with --$credential_target"
   if [[ -n "$credential_target" ]]; then
     setup_single_credential "$credential_target"
+  elif [[ "$edit_mode" == "true" ]]; then
+    setup_wizard true
   elif [[ -n "$source_file" ]]; then
     setup_from_config "$source_file"
   else
@@ -514,91 +534,210 @@ setup_command() {
   fi
 }
 
+job_path_from_input() {
+  local input="$1"
+  local base_url="${2%/}"
+  local raw_path segment decoded result=""
+
+  if [[ "$input" == http://* || "$input" == https://* ]]; then
+    [[ "$input" != *\?* && "$input" != *\#* ]] || fail "Job URL must not contain a query or fragment"
+    local prefix="$base_url/job/"
+    [[ "$input" == "$prefix"* ]] || fail "Job URL must be under $base_url"
+    raw_path="${input#$prefix}"
+    raw_path="${raw_path%/}"
+    raw_path="$(print -r -- "$raw_path" | sed 's#/job/#/#g')"
+  else
+    raw_path="${input#/}"
+    raw_path="${raw_path%/}"
+  fi
+  [[ -n "$raw_path" ]] || fail "Jenkins job URL is required"
+  for segment in "${(@s:/:)raw_path}"; do
+    decoded="$(jq -nr --arg value "$segment" '$value | @urid')" || fail "Invalid Jenkins job URL"
+    [[ -n "$decoded" && "$decoded" != */* ]] || fail "Invalid Jenkins job URL"
+    [[ -z "$result" ]] || result+="/"
+    result+="$decoded"
+  done
+  print -r -- "$result"
+}
+
+job_url_from_path() {
+  local base_url="${1%/}"
+  local job_path_value="$2"
+  local result="$base_url" segment
+  for segment in "${(@s:/:)job_path_value}"; do
+    [[ -n "$segment" ]] || continue
+    result+="/job/$(url_encode "$segment")"
+  done
+  print -r -- "$result"
+}
+
 setup_wizard() {
+  local edit_mode="${1:-false}"
   command -v jq >/dev/null 2>&1 || fail "jq is required; install with: brew install jq"
   command -v security >/dev/null 2>&1 || fail "macOS Keychain is required"
 
-  if [[ -f "$config_file" ]] && ! confirm "Replace current config?" "no"; then
+  local has_config="false"
+  [[ -f "$config_file" ]] && has_config="true"
+  if [[ "$edit_mode" == "true" && "$has_config" != "true" ]]; then
+    fail "Not configured. Run: jenkins-batch setup"
+  fi
+  if [[ "$edit_mode" != "true" && "$has_config" == "true" ]] \
+      && ! confirm "Replace current config?" "no"; then
     return
   fi
 
-  print -- "Setup"
+  [[ "$edit_mode" == "true" ]] && print -- "Edit config" || print -- "Setup"
 
   local default_repo="$PWD"
   local detected_repo
   detected_repo="$(git rev-parse --show-toplevel 2>/dev/null || true)"
   [[ -n "$detected_repo" ]] && default_repo="$detected_repo"
 
+  local default_jenkins_url="https://jenkins.example.com" default_jenkins_user=""
+  local default_jenkins_token_url="" default_remote="origin" default_owner=""
+  local default_branch_parameter="sourceBranch"
+  local default_ticket_pattern='[[:alpha:]][[:alnum:]]*-[[:digit:]]+'
+  local default_log_dir="~/Library/Logs/jenkins-batch"
+  local default_queue_timeout="1800" default_build_timeout="21600" default_poll_interval="30"
+  local default_jenkins_insecure="false" default_issue_enabled="false"
+  local default_issue_browse_url="https://jira.example.com/browse"
+  local default_issue_api_url="https://jira.example.com/rest/api/2"
+  local default_issue_user="" default_issue_token_url="" default_issue_auth_mode="auto"
+  local default_issue_parameter="ISSUE_URL" default_issue_insecure="false" default_job_count="3"
+  local previous_jenkins_user="" previous_issue_user=""
+  if [[ "$has_config" == "true" ]]; then
+    validate_config_file "$config_file" || fail "Invalid configuration: $config_file"
+    default_jenkins_url="$(jq -r '.jenkins.url' "$config_file")"
+    default_jenkins_user="$(jq -r '.jenkins.user' "$config_file")"
+    default_jenkins_token_url="$(jq -r '.jenkins.tokenUrl // empty' "$config_file")"
+    default_repo="$(jq -r '.repository.path' "$config_file")"
+    default_remote="$(jq -r '.repository.remote // "origin"' "$config_file")"
+    default_owner="$(jq -r '.repository.branchOwner // empty' "$config_file")"
+    default_branch_parameter="$(jq -r '.repository.branchParameter // empty' "$config_file")"
+    default_ticket_pattern="$(jq -r '.repository.ticketPattern // empty' "$config_file")"
+    default_log_dir="$(jq -r '.logDirectory // "~/Library/Logs/jenkins-batch"' "$config_file")"
+    default_queue_timeout="$(jq -r '.jenkins.queueTimeout // 1800' "$config_file")"
+    default_build_timeout="$(jq -r '.jenkins.buildTimeout // 21600' "$config_file")"
+    default_poll_interval="$(jq -r '.jenkins.pollInterval // 30' "$config_file")"
+    default_jenkins_insecure="$(jq -r '.jenkins.insecure // false' "$config_file")"
+    default_issue_enabled="$(jq -r '.issueTracker.enabled // false' "$config_file")"
+    default_issue_browse_url="$(jq -r '.issueTracker.browseUrl // empty' "$config_file")"
+    default_issue_api_url="$(jq -r '.issueTracker.apiUrl // empty' "$config_file")"
+    default_issue_user="$(jq -r '.issueTracker.user // empty' "$config_file")"
+    default_issue_token_url="$(jq -r '.issueTracker.tokenUrl // empty' "$config_file")"
+    default_issue_auth_mode="$(jq -r '.issueTracker.authMode // "auto"' "$config_file")"
+    default_issue_parameter="$(jq -r '.issueTracker.jobParameter // empty' "$config_file")"
+    default_issue_insecure="$(jq -r '.issueTracker.insecure // false' "$config_file")"
+    default_job_count="$(jq -r '.jobs | length' "$config_file")"
+    previous_jenkins_user="$default_jenkins_user"
+    previous_issue_user="$default_issue_user"
+  fi
+
   local setup_jenkins_url setup_jenkins_user setup_jenkins_token_url setup_repo setup_remote setup_owner
   local setup_branch_parameter setup_ticket_pattern setup_log_dir
-  setup_jenkins_url="$(prompt_required "Jenkins URL" "https://jenkins.example.com")"
+  setup_jenkins_url="$(prompt_required "Jenkins URL" "$default_jenkins_url")"
   setup_jenkins_url="${setup_jenkins_url%/}"
-  setup_jenkins_user="$(prompt_required "Jenkins username")"
-  setup_jenkins_token_url="$setup_jenkins_url/me/configure"
+  setup_jenkins_user="$(prompt_required "Jenkins username" "$default_jenkins_user")"
+  [[ -n "$default_jenkins_token_url" ]] || default_jenkins_token_url="$setup_jenkins_url/me/configure"
+  setup_jenkins_token_url="$(prompt "Jenkins token URL" "$default_jenkins_token_url")"
   setup_repo="$(prompt_required "Local repository" "$default_repo")"
   setup_repo="$(expand_user_path "$setup_repo")"
-  setup_remote="$(prompt "Git remote" "origin")"
-  setup_owner="$(prompt "Remote branch namespace (optional)")"
-  setup_branch_parameter="$(prompt "Jenkins branch parameter" "sourceBranch")"
-  setup_ticket_pattern="$(prompt "Issue key regex" '[[:alpha:]][[:alnum:]]*-[[:digit:]]+')"
-  setup_log_dir="$(prompt "Watcher log directory" "~/Library/Logs/jenkins-batch")"
+  setup_remote="$(prompt "Git remote" "$default_remote")"
+  setup_owner="$(prompt "Remote branch namespace (optional)" "$default_owner")"
+  setup_branch_parameter="$(prompt "Jenkins branch parameter" "$default_branch_parameter")"
+  setup_ticket_pattern="$(prompt "Issue key regex" "$default_ticket_pattern")"
+  setup_log_dir="$(prompt "Watcher log directory" "$default_log_dir")"
 
   local setup_queue_timeout setup_build_timeout setup_poll_interval setup_jenkins_insecure="false"
-  setup_queue_timeout="$(prompt "Queue timeout in seconds" "1800")"
-  setup_build_timeout="$(prompt "Build timeout in seconds" "21600")"
-  setup_poll_interval="$(prompt "Build poll interval in seconds" "30")"
+  setup_queue_timeout="$(prompt "Queue timeout in seconds" "$default_queue_timeout")"
+  setup_build_timeout="$(prompt "Build timeout in seconds" "$default_build_timeout")"
+  setup_poll_interval="$(prompt "Build poll interval in seconds" "$default_poll_interval")"
   validate_integer "Queue timeout" "$setup_queue_timeout"
   validate_integer "Build timeout" "$setup_build_timeout"
   validate_integer "Build poll interval" "$setup_poll_interval"
-  confirm "Disable Jenkins TLS verification?" "no" && setup_jenkins_insecure="true"
+  local jenkins_insecure_default="no"
+  [[ "$default_jenkins_insecure" == "true" ]] && jenkins_insecure_default="yes"
+  confirm "Disable Jenkins TLS verification?" "$jenkins_insecure_default" && setup_jenkins_insecure="true"
 
   local setup_issue_enabled="false"
   local setup_issue_browse_url="" setup_issue_api_url="" setup_issue_user="" setup_issue_token_url=""
   local setup_issue_auth_mode="auto" setup_issue_parameter="" setup_issue_insecure="false"
-  if confirm "Configure Jira-compatible completion comments?" "no"; then
+  local issue_enabled_default="no"
+  [[ "$default_issue_enabled" == "true" ]] && issue_enabled_default="yes"
+  if confirm "Configure Jira-compatible completion comments?" "$issue_enabled_default"; then
     setup_issue_enabled="true"
-    setup_issue_browse_url="$(prompt_required "Issue browse URL" "https://jira.example.com/browse")"
+    setup_issue_browse_url="$(prompt_required "Issue browse URL" "$default_issue_browse_url")"
     setup_issue_browse_url="${setup_issue_browse_url%/}"
-    setup_issue_api_url="$(prompt_required "Issue REST API URL" "https://jira.example.com/rest/api/2")"
+    setup_issue_api_url="$(prompt_required "Issue REST API URL" "$default_issue_api_url")"
     setup_issue_api_url="${setup_issue_api_url%/}"
-    setup_issue_user="$(prompt_required "Issue tracker username")"
-    setup_issue_token_url="$(default_issue_token_url "$setup_issue_api_url")"
-    setup_issue_auth_mode="$(prompt "Authentication mode (auto, basic, bearer)" "auto")"
+    setup_issue_user="$(prompt_required "Issue tracker username" "$default_issue_user")"
+    [[ -n "$default_issue_token_url" ]] || default_issue_token_url="$(default_issue_token_url "$setup_issue_api_url")"
+    setup_issue_token_url="$(prompt "Issue token URL" "$default_issue_token_url")"
+    setup_issue_auth_mode="$(prompt "Authentication mode (auto, basic, bearer)" "$default_issue_auth_mode")"
     case "$setup_issue_auth_mode" in
       auto|basic|bearer) ;;
       *) fail "Authentication mode must be auto, basic, or bearer" ;;
     esac
-    setup_issue_parameter="$(prompt "Jenkins issue URL parameter (optional)" "ISSUE_URL")"
-    confirm "Disable issue tracker TLS verification?" "no" && setup_issue_insecure="true"
+    setup_issue_parameter="$(prompt "Jenkins issue URL parameter (optional)" "$default_issue_parameter")"
+    local issue_insecure_default="no"
+    [[ "$default_issue_insecure" == "true" ]] && issue_insecure_default="yes"
+    confirm "Disable issue tracker TLS verification?" "$issue_insecure_default" && setup_issue_insecure="true"
   fi
 
   local job_count
-  job_count="$(prompt "Number of jobs in the batch" "3")"
+  job_count="$(prompt "Number of jobs" "$default_job_count")"
   case "$job_count" in
     ''|*[!0-9]*) fail "Job count must be a positive integer" ;;
   esac
   (( job_count > 0 )) || fail "Job count must be a positive integer"
 
   local jobs='[]'
-  local index label job_path raw_parameters encoded_parameters link_label link_regex
+  local index config_index label job_input job_path job_url raw_parameters encoded_parameters
+  local link_label link_regex enabled_by_default enabled_default
+  local default_label default_job_input default_parameters default_link_label default_link_regex
   for (( index = 1; index <= job_count; index += 1 )); do
+    config_index=$(( index - 1 ))
+    default_label="Job $index"
+    default_job_input=""
+    default_parameters=""
+    default_link_label="Artifact"
+    default_link_regex=""
+    enabled_default="yes"
+    if [[ "$has_config" == "true" && $index -le $default_job_count ]]; then
+      default_label="$(jq -r ".jobs[$config_index].label" "$config_file")"
+      default_job_input="$(jq -r ".jobs[$config_index].url // empty" "$config_file")"
+      if [[ -z "$default_job_input" ]]; then
+        default_job_input="$(job_url_from_path "$setup_jenkins_url" "$(jq -r ".jobs[$config_index].path" "$config_file")")"
+      fi
+      default_parameters="$(jq -r ".jobs[$config_index].parameters // {} | to_entries | map(.key + \"=\" + (.value | tostring)) | join(\",\")" "$config_file")"
+      default_link_label="$(jq -r ".jobs[$config_index].linkLabel // \"Artifact\"" "$config_file")"
+      default_link_regex="$(jq -r ".jobs[$config_index].linkRegex // empty" "$config_file")"
+      [[ "$(jq -r ".jobs[$config_index] | if has(\"enabledByDefault\") then .enabledByDefault else true end" "$config_file")" == "true" ]] \
+        || enabled_default="no"
+    fi
     print
     print -- "Job $index"
-    label="$(prompt_required "  Display name" "Job $index")"
-    job_path="$(prompt_required "  Jenkins job path")"
-    raw_parameters="$(prompt "  Parameters (KEY=value, comma-separated)")"
+    label="$(prompt_required "  Name" "$default_label")"
+    job_input="$(prompt_required "  Jenkins job URL" "$default_job_input")"
+    job_path="$(job_path_from_input "$job_input" "$setup_jenkins_url")"
+    job_url="$(job_url_from_path "$setup_jenkins_url" "$job_path")"
+    enabled_by_default="false"
+    confirm "  Enabled by default?" "$enabled_default" && enabled_by_default="true"
+    raw_parameters="$(prompt "  Parameters (KEY=value, comma-separated)" "$default_parameters")"
     encoded_parameters="$(parameters_json "$raw_parameters")"
-    link_regex="$(prompt "  Artifact URL regex for comments (optional)")"
+    link_regex="$(prompt "  Artifact URL regex for comments (optional)" "$default_link_regex")"
     link_label=""
-    [[ -n "$link_regex" ]] && link_label="$(prompt "  Artifact link label" "Artifact")"
+    [[ -n "$link_regex" ]] && link_label="$(prompt "  Artifact link label" "$default_link_label")"
 
     jobs="$(jq -c \
       --arg label "$label" \
       --arg path "$job_path" \
+      --arg url "$job_url" \
+      --argjson enabledByDefault "$enabled_by_default" \
       --argjson parameters "$encoded_parameters" \
       --arg linkLabel "$link_label" \
       --arg linkRegex "$link_regex" \
-      '. + [{label: $label, path: $path, parameters: $parameters, linkLabel: $linkLabel, linkRegex: $linkRegex}]' \
+      '. + [{label: $label, path: $path, url: $url, enabledByDefault: $enabledByDefault, parameters: $parameters, linkLabel: $linkLabel, linkRegex: $linkRegex}]' \
       <<< "$jobs")" || fail "Could not encode jobs"
   done
 
@@ -662,10 +801,18 @@ setup_wizard() {
       jobs: $jobs
     }' > "$temporary_config" || fail "Could not write configuration"
 
+  validate_config_file "$temporary_config" || fail "Could not create a valid configuration"
   chmod 600 "$temporary_config"
   mv -f "$temporary_config" "$config_file"
 
-  save_setup_credentials "$config_file"
+  if [[ "$edit_mode" == "true" ]]; then
+    [[ "$previous_jenkins_user" == "$setup_jenkins_user" ]] \
+      || print -- "Run: jenkins-batch setup --jenkins"
+    [[ "$setup_issue_enabled" != "true" || "$previous_issue_user" == "$setup_issue_user" ]] \
+      || print -- "Run: jenkins-batch setup --issue"
+  else
+    save_setup_credentials "$config_file"
+  fi
   print -- "Ready."
 }
 
@@ -684,16 +831,27 @@ load_jobs() {
   job_parameters=()
   job_link_labels=()
   job_link_regexes=()
+  job_enabled_defaults=()
+  job_config_indices=()
 
-  local label job_path parameters link_label link_regex
-  while IFS=$'\t' read -r label job_path parameters link_label link_regex; do
+  local job label job_path parameters link_label link_regex enabled index=0
+  while IFS= read -r job; do
+    label="$(jq -r '.label' <<< "$job")"
+    job_path="$(jq -r '.path' <<< "$job")"
+    parameters="$(jq -c '.parameters // {}' <<< "$job")"
+    link_label="$(jq -r '.linkLabel // empty' <<< "$job")"
+    link_regex="$(jq -r '.linkRegex // empty' <<< "$job")"
+    enabled="$(jq -r 'if has("enabledByDefault") then .enabledByDefault else true end' <<< "$job")"
     [[ -n "$label" && -n "$job_path" ]] || fail "Every job needs a label and path"
+    (( index += 1 ))
     job_labels+=("$label")
     job_paths+=("$job_path")
     job_parameters+=("$parameters")
     job_link_labels+=("$link_label")
     job_link_regexes+=("$link_regex")
-  done < <(jq -r '.jobs[] | [.label, .path, (.parameters // {} | tojson), (.linkLabel // ""), (.linkRegex // "")] | @tsv' "$config_file")
+    job_enabled_defaults+=("$enabled")
+    job_config_indices+=("$index")
+  done < <(jq -c '.jobs[]' "$config_file")
 
   (( ${#job_labels[@]} > 0 )) || fail "No jobs are configured; run: jenkins-batch setup"
 }
@@ -814,8 +972,29 @@ config_command() {
       [[ -f "$config_file" ]] || fail "Not configured. Run: jenkins-batch setup"
       "${EDITOR:-vi}" "$config_file"
       ;;
-    *) fail "Usage: jenkins-batch config <path|show|edit>" ;;
+    wizard) setup_wizard true ;;
+    *) fail "Usage: jenkins-batch config <path|show|edit|wizard>" ;;
   esac
+}
+
+ensure_config() {
+  [[ -f "$config_file" ]] && return
+  [[ -t 0 ]] || fail "Not configured. Run: jenkins-batch setup"
+  print -- "No config. Starting setup."
+  setup_wizard
+}
+
+jobs_command() {
+  local index config_index url state
+  for (( index = 1; index <= ${#job_labels[@]}; index += 1 )); do
+    config_index=$(( job_config_indices[$index] - 1 ))
+    url="$(jq -r ".jobs[$config_index].url // empty" "$config_file")"
+    [[ -n "$url" ]] || url="$(job_url_from_path "$jenkins_url" "${job_paths[$index]}")"
+    state="optional"
+    [[ "${job_enabled_defaults[$index]}" == "true" ]] && state="default"
+    print -- "$index. ${job_labels[$index]} [$state]"
+    print -- "   $url"
+  done
 }
 
 is_issue_key() {
@@ -1144,7 +1323,7 @@ run_one() {
   local comments="$4"
   local verbose="$5"
   local branch issue_key issue_url=""
-  branch="$(resolve_branch "$target")"
+  branch="$(resolve_branch "$target")" || return 1
   issue_key="$issue_override"
   if [[ -z "$issue_key" && "$issue_enabled" == "true" ]]; then
     issue_key="$(extract_issue_key "$branch" || true)"
@@ -1194,14 +1373,120 @@ run_one() {
   cleanup
 }
 
+job_index_for_selector() {
+  local selector="$1"
+  local index wanted label
+  case "$selector" in
+    ''|*[!0-9]*) ;;
+    *)
+      (( selector >= 1 && selector <= ${#job_labels[@]} )) || fail "Unknown job: $selector"
+      print -r -- "$selector"
+      return
+      ;;
+  esac
+  wanted="$(print -r -- "$selector" | tr '[:upper:]' '[:lower:]')"
+  for (( index = 1; index <= ${#job_labels[@]}; index += 1 )); do
+    label="$(print -r -- "${job_labels[$index]}" | tr '[:upper:]' '[:lower:]')"
+    if [[ "$label" == "$wanted" ]]; then
+      print -r -- "$index"
+      return
+    fi
+  done
+  fail "Unknown job: $selector"
+}
+
+apply_job_selection() {
+  local -a selected=("$@")
+  local -a old_labels=("${job_labels[@]}") old_paths=("${job_paths[@]}")
+  local -a old_parameters=("${job_parameters[@]}") old_link_labels=("${job_link_labels[@]}")
+  local -a old_link_regexes=("${job_link_regexes[@]}") old_defaults=("${job_enabled_defaults[@]}")
+  local -a old_config_indices=("${job_config_indices[@]}")
+  local index
+  job_labels=()
+  job_paths=()
+  job_parameters=()
+  job_link_labels=()
+  job_link_regexes=()
+  job_enabled_defaults=()
+  job_config_indices=()
+  for index in "${selected[@]}"; do
+    job_labels+=("${old_labels[$index]}")
+    job_paths+=("${old_paths[$index]}")
+    job_parameters+=("${old_parameters[$index]}")
+    job_link_labels+=("${old_link_labels[$index]}")
+    job_link_regexes+=("${old_link_regexes[$index]}")
+    job_enabled_defaults+=("${old_defaults[$index]}")
+    job_config_indices+=("${old_config_indices[$index]}")
+  done
+}
+
+select_jobs_for_run() {
+  local mode="$1"
+  shift
+  local -a selectors=("$@") selected=()
+  local index selector default_answer
+  typeset -A seen
+  case "$mode" in
+    all)
+      for (( index = 1; index <= ${#job_labels[@]}; index += 1 )); do
+        selected+=("$index")
+      done
+      ;;
+    interactive)
+      [[ -t 0 ]] || fail "--select requires an interactive terminal"
+      print -- "Select jobs"
+      for (( index = 1; index <= ${#job_labels[@]}; index += 1 )); do
+        default_answer="no"
+        [[ "${job_enabled_defaults[$index]}" == "true" ]] && default_answer="yes"
+        confirm "${job_labels[$index]}?" "$default_answer" && selected+=("$index")
+      done
+      ;;
+    explicit)
+      for selector in "${selectors[@]}"; do
+        index="$(job_index_for_selector "$selector")"
+        if [[ -z "${seen[$index]:-}" ]]; then
+          selected+=("$index")
+          seen[$index]=1
+        fi
+      done
+      ;;
+    default)
+      for (( index = 1; index <= ${#job_labels[@]}; index += 1 )); do
+        [[ "${job_enabled_defaults[$index]}" == "true" ]] && selected+=("$index")
+      done
+      ;;
+  esac
+  (( ${#selected[@]} > 0 )) || fail "No jobs selected. Use --select, --job NAME, or --all"
+  apply_job_selection "${selected[@]}"
+}
+
 run_command() {
   local dry_run="false" comments="true" verbose="false" issue_override=""
-  local -a targets=()
+  local selection_mode="default"
+  local -a targets=() job_selectors=()
   while (( $# > 0 )); do
     case "$1" in
       -n|--dry-run) dry_run="true"; shift ;;
       --no-comment) comments="false"; shift ;;
       -v|--verbose) verbose="true"; shift ;;
+      -j|--job)
+        (( $# >= 2 )) || fail "--job needs a name or number"
+        [[ "$selection_mode" == "default" || "$selection_mode" == "explicit" ]] \
+          || fail "--job cannot be combined with --all or --select"
+        selection_mode="explicit"
+        job_selectors+=("$2")
+        shift 2
+        ;;
+      --all)
+        [[ "$selection_mode" == "default" ]] || fail "--all cannot be combined with another job selection"
+        selection_mode="all"
+        shift
+        ;;
+      --select)
+        [[ "$selection_mode" == "default" ]] || fail "--select cannot be combined with another job selection"
+        selection_mode="interactive"
+        shift
+        ;;
       -i|--issue)
         (( $# >= 2 )) || fail "--issue needs a key"
         issue_override="$2"
@@ -1215,9 +1500,10 @@ run_command() {
   (( ${#targets[@]} > 0 )) || targets=("")
   (( ${#targets[@]} == 1 )) || [[ -z "$issue_override" ]] \
     || fail "--issue can only be used with one target"
+  select_jobs_for_run "$selection_mode" "${job_selectors[@]}"
   local target
   for target in "${targets[@]}"; do
-    run_one "$target" "$issue_override" "$dry_run" "$comments" "$verbose"
+    run_one "$target" "$issue_override" "$dry_run" "$comments" "$verbose" || return 1
   done
 }
 
@@ -1272,7 +1558,7 @@ cancel_one() {
   local assume_yes="$3"
   [[ -n "$branch_parameter" ]] || fail "Cancel requires repository.branchParameter"
   local branch matches kind identifier label url answer http_code index=0 failures=0
-  branch="$(resolve_branch "$target")"
+  branch="$(resolve_branch "$target")" || return 1
   load_jenkins_token
   load_runtime
   prepare_jenkins_session
@@ -1331,7 +1617,7 @@ cancel_command() {
   (( ${#targets[@]} > 0 )) || targets=("")
   local target
   for target in "${targets[@]}"; do
-    cancel_one "$target" "$dry_run" "$assume_yes"
+    cancel_one "$target" "$dry_run" "$assume_yes" || return 1
   done
 }
 
@@ -1515,7 +1801,7 @@ start_watchers() {
       -o "$log_file" \
       -e "$log_file" \
       -- /usr/bin/env JENKINS_BATCH_CONFIG="$config_file" \
-      "$SCRIPT_PATH" __watch "$launchd_label" "$branch" "$issue_key" "$index" "${pipeline_urls[$index]}" \
+      "$SCRIPT_PATH" __watch "$launchd_label" "$branch" "$issue_key" "${job_config_indices[$index]}" "${pipeline_urls[$index]}" \
       || fail "Builds started, but a completion watcher could not start"
     (( count += 1 ))
   done
@@ -1533,14 +1819,16 @@ main() {
 
   case "$command" in
     setup) setup_command "$@" ;;
-    doctor) doctor "$@" ;;
+    doctor) ensure_config; doctor "$@" ;;
     config) config_command "$@" ;;
-    run) load_config; run_command "$@" ;;
-    cancel) load_config; cancel_command "$@" ;;
+    jobs) ensure_config; load_config; jobs_command "$@" ;;
+    run) ensure_config; load_config; run_command "$@" ;;
+    cancel) ensure_config; load_config; cancel_command "$@" ;;
     help|-h|--help) show_help "${1:-}" ;;
     version|-V|--version) print -- "$APP_NAME $APP_VERSION" ;;
     *)
       # Backward-friendly shorthand: `jenkins-batch BRANCH`.
+      ensure_config
       load_config
       run_command "$command" "$@"
       ;;

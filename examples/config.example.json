@@ -31,6 +31,8 @@
     {
       "label": "Simulator QA",
       "path": "Mobile/Simulator",
+      "url": "https://jenkins.example.com/job/Mobile/job/Simulator",
+      "enabledByDefault": true,
       "parameters": {
         "BUILD_CONFIGURATION": "QA"
       },
@@ -40,6 +42,8 @@
     {
       "label": "Simulator Debug",
       "path": "Mobile/Simulator",
+      "url": "https://jenkins.example.com/job/Mobile/job/Simulator",
+      "enabledByDefault": false,
       "parameters": {
         "BUILD_CONFIGURATION": "Debug"
       },
@@ -49,6 +53,8 @@
     {
       "label": "Device",
       "path": "Mobile/Device",
+      "url": "https://jenkins.example.com/job/Mobile/job/Device",
+      "enabledByDefault": false,
       "parameters": {},
       "linkLabel": "Install",
       "linkRegex": "https://install[.]example[.]com/builds/[[:alnum:]-]+"
