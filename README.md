@@ -5,9 +5,7 @@ Launch a configured group of Jenkins jobs from macOS.
 ## Install
 
 ```sh
-brew tap heartsker/jenkins-batch
-brew trust heartsker/jenkins-batch
-brew install jenkins-batch
+brew install heartsker/jenkins-batch/jenkins-batch
 ```
 
 ## Setup
