@@ -5,7 +5,7 @@ setopt PIPE_FAIL
 unsetopt BG_NICE
 
 readonly APP_NAME="jenkins-batch"
-readonly APP_VERSION="0.5.0"
+readonly APP_VERSION="0.5.1"
 readonly SCRIPT_PATH="${0:A}"
 readonly JENKINS_KEYCHAIN_SERVICE="io.github.heartsker.jenkins-batch.jenkins"
 readonly ISSUE_KEYCHAIN_SERVICE="io.github.heartsker.jenkins-batch.issue-tracker"
@@ -25,6 +25,7 @@ typeset -g ui_dim=""
 typeset -g ui_accent=""
 typeset -g ui_reset=""
 typeset -g menu_choice=""
+typeset -g menu_cursor_hidden="false"
 typeset -ga menu_keys=()
 typeset -ga menu_labels=()
 typeset -ga menu_values=()
@@ -143,7 +144,7 @@ note() {
 }
 
 cleanup() {
-  [[ -t 2 ]] && print -nu2 -- $'\e[?25h'
+  [[ "$menu_cursor_hidden" == "true" && -t 1 ]] && print -n -- $'\e[?25h'
   if [[ -n "$runtime_dir" && -d "$runtime_dir" ]]; then
     rm -rf -- "$runtime_dir"
   fi
@@ -281,6 +282,7 @@ menu_select() {
 
   print -- "${ui_dim}  ↑/↓ move · enter select${ui_reset}"
   print -n -- $'\e[?25l'
+  menu_cursor_hidden="true"
   menu_render "$selected"
   while true; do
     key=""
@@ -315,6 +317,7 @@ menu_select() {
     menu_render "$selected"
   done
   print -n -- $'\e[?25h'
+  menu_cursor_hidden="false"
 }
 
 prompt_secret() {
