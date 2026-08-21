@@ -5,7 +5,7 @@ setopt PIPE_FAIL
 unsetopt BG_NICE
 
 readonly APP_NAME="jenkins-batch"
-readonly APP_VERSION="0.3.0"
+readonly APP_VERSION="0.4.0"
 readonly SCRIPT_PATH="${0:A}"
 readonly JENKINS_KEYCHAIN_SERVICE="io.github.heartsker.jenkins-batch.jenkins"
 readonly ISSUE_KEYCHAIN_SERVICE="io.github.heartsker.jenkins-batch.issue-tracker"
@@ -59,16 +59,14 @@ help_main() {
 jenkins-batch — launch a configured group of Jenkins jobs.
 
 Usage:
-  jenkins-batch setup [--config FILE|--edit|--jenkins|--issue]
+  jenkins-batch setup
   jenkins-batch run [TARGET ...] [options]
   jenkins-batch cancel [TARGET ...] [options]
   jenkins-batch jobs
   jenkins-batch doctor
-  jenkins-batch config <path|show|edit|wizard>
 
 Start:
-  jenkins-batch setup --config team.json
-  jenkins-batch config wizard [jenkins|repository|issue|jobs|runtime]
+  jenkins-batch setup
   jenkins-batch run [--select|--job NAME|--all]
 
 More: jenkins-batch help <setup|run|cancel>
@@ -77,14 +75,10 @@ HELP
 
 help_setup() {
   cat <<'HELP'
-jenkins-batch setup [--config FILE|--edit|--jenkins|--issue]
+jenkins-batch setup
 
-Without FILE: interactive wizard.
-With FILE: import settings, then ask only for identity (if missing) and tokens.
---jenkins or --issue: replace one saved token.
---edit: update the config in a wizard.
-
-  jenkins-batch setup --config team.json
+Opens one wizard for importing or editing config, managing jobs, and replacing
+Jenkins or issue tracker tokens.
 
 Config: ~/.config/jenkins-batch/config.json
 Tokens: macOS Keychain
@@ -234,7 +228,7 @@ ui_item() {
 
 read_choice() {
   local value=""
-  read "value?Select: "
+  read "value?Select: " || { print -- "q"; return; }
   print -r -- "$value"
 }
 
@@ -563,8 +557,40 @@ setup_command() {
   elif [[ -n "$source_file" ]]; then
     setup_from_config "$source_file"
   else
-    setup_wizard
+    setup_interactive
   fi
+}
+
+setup_interactive() {
+  command -v jq >/dev/null 2>&1 || fail "jq is required; install with: brew install jq"
+  command -v security >/dev/null 2>&1 || fail "macOS Keychain is required"
+  if [[ -f "$config_file" ]]; then
+    config_edit_wizard "" true
+    return
+  fi
+
+  init_ui
+  local choice source_file
+  while [[ ! -f "$config_file" ]]; do
+    ui_title "Jenkins Batch Setup"
+    print -- "  Config stores links, jobs, and runtime settings."
+    print -- "  Tokens stay in macOS Keychain."
+    print
+    ui_item 1 "Import config" "team JSON"
+    ui_item 2 "Manual setup"
+    ui_item q "Quit"
+    choice="$(read_choice)"
+    case "$choice" in
+      1)
+        source_file="$(prompt_required "Config file")"
+        setup_from_config "$source_file"
+        ;;
+      2) setup_wizard ;;
+      q|Q) return ;;
+      *) note "Unknown choice" ;;
+    esac
+  done
+  config_edit_wizard "" true
 }
 
 job_path_from_input() {
@@ -623,7 +649,8 @@ setup_wizard() {
     return
   fi
 
-  [[ "$edit_mode" == "true" ]] && print -- "Edit config" || print -- "Setup"
+  init_ui
+  ui_title "Manual setup"
 
   local default_repo="$PWD"
   local detected_repo
@@ -1196,14 +1223,42 @@ run_config_section() {
   esac
 }
 
+credential_state() {
+  local service="$1"
+  local account="$2"
+  if [[ -n "$account" ]] \
+      && security find-generic-password -a "$account" -s "$service" >/dev/null 2>&1; then
+    print -- "stored"
+  else
+    print -- "missing"
+  fi
+}
+
+save_before_setup_action() {
+  local working="$1"
+  local action="$2"
+  cmp -s "$working" "$config_file" && return
+  if confirm "Save changes before $action?" "yes"; then
+    save_wizard_config "$working"
+  else
+    note "Save or discard config changes first."
+    return 1
+  fi
+}
+
 config_edit_wizard() {
   local initial_section="${1:-}"
+  local setup_mode="${2:-false}"
   command -v jq >/dev/null 2>&1 || fail "jq is required; install with: brew install jq"
+  [[ "$setup_mode" != "true" ]] \
+    || command -v security >/dev/null 2>&1 \
+    || fail "macOS Keychain is required"
   [[ -f "$config_file" ]] || fail "Not configured. Run: jenkins-batch setup"
   validate_config_file "$config_file" || fail "Invalid configuration: $config_file"
   init_ui
 
   local wizard_dir working choice job_count default_count issue_state
+  local jenkins_credential issue_credential source_file title
   wizard_dir="$(mktemp -d "${TMPDIR:-/tmp}/jenkins-batch-config.XXXXXX")" \
     || fail "Could not create temporary configuration"
   working="$wizard_dir/config.json"
@@ -1230,13 +1285,28 @@ config_edit_wizard() {
     default_count="$(jq -r '[.jobs[] | select((if has("enabledByDefault") then .enabledByDefault else true end) == true)] | length' "$working")"
     issue_state="disabled"
     [[ "$(jq -r '.issueTracker.enabled // false' "$working")" == "true" ]] && issue_state="enabled"
-    ui_title "Config wizard"
+    title="Config wizard"
+    [[ "$setup_mode" == "true" ]] && title="Jenkins Batch Setup"
+    ui_title "$title"
+    [[ "$setup_mode" == "true" ]] && print -- "  ${ui_dim}Config: $config_file${ui_reset}"
+    [[ "$setup_mode" == "true" ]] && print
     ui_item 1 "Jenkins" "$(jq -r '.jenkins.url' "$working")"
     ui_item 2 "Repository" "$(jq -r '.repository.path' "$working")"
     ui_item 3 "Issue tracker" "$issue_state"
     ui_item 4 "Jobs" "$job_count total · $default_count default"
     ui_item 5 "Runtime" "poll $(jq -r '.jenkins.pollInterval // 30' "$working")s"
-    ui_item s "Save & exit"
+    if [[ "$setup_mode" == "true" ]]; then
+      jenkins_credential="$(credential_state "$JENKINS_KEYCHAIN_SERVICE" "$(jq -r '.jenkins.user' "$working")")"
+      issue_credential="disabled"
+      [[ "$issue_state" != "enabled" ]] \
+        || issue_credential="$(credential_state "$ISSUE_KEYCHAIN_SERVICE" "$(jq -r '.issueTracker.user // empty' "$working")")"
+      ui_item 6 "Jenkins token" "$jenkins_credential"
+      ui_item 7 "Issue token" "$issue_credential"
+      ui_item i "Import config" "team JSON"
+      ui_item s "Save & done"
+    else
+      ui_item s "Save & exit"
+    fi
     ui_item q "Quit"
     choice="$(read_choice)"
     case "$choice" in
@@ -1245,12 +1315,40 @@ config_edit_wizard() {
       3) edit_issue_menu "$working" ;;
       4) edit_jobs_menu "$working" ;;
       5) edit_runtime_menu "$working" ;;
+      6)
+        [[ "$setup_mode" == "true" ]] || { note "Unknown choice"; continue; }
+        save_before_setup_action "$working" "updating the Jenkins token" || continue
+        setup_single_credential jenkins
+        jq . "$config_file" > "$working" || fail "Could not reload configuration"
+        ;;
+      7)
+        [[ "$setup_mode" == "true" ]] || { note "Unknown choice"; continue; }
+        [[ "$issue_state" == "enabled" ]] || { note "Issue tracker is disabled"; continue; }
+        save_before_setup_action "$working" "updating the issue token" || continue
+        setup_single_credential issue
+        jq . "$config_file" > "$working" || fail "Could not reload configuration"
+        ;;
+      i|I)
+        [[ "$setup_mode" == "true" ]] || { note "Unknown choice"; continue; }
+        if ! cmp -s "$working" "$config_file"; then
+          note "Save or discard config changes before importing."
+          continue
+        fi
+        source_file="$(prompt_required "Config file")"
+        setup_from_config "$source_file"
+        jq . "$config_file" > "$working" || fail "Could not reload configuration"
+        ;;
       s|S)
+        if [[ "$setup_mode" == "true" ]] && cmp -s "$working" "$config_file"; then
+          print -- "Done."
+          rm -rf -- "$wizard_dir"
+          return
+        fi
         save_wizard_config "$working" && { rm -rf -- "$wizard_dir"; return; }
         ;;
       q|Q)
         if cmp -s "$working" "$config_file"; then
-          print -- "No changes."
+          [[ "$setup_mode" == "true" ]] && print -- "Done." || print -- "No changes."
           rm -rf -- "$wizard_dir"
           return
         fi
@@ -1430,7 +1528,8 @@ ensure_config() {
   [[ -f "$config_file" ]] && return
   [[ -t 0 ]] || fail "Not configured. Run: jenkins-batch setup"
   print -- "No config. Starting setup."
-  setup_wizard
+  setup_interactive
+  [[ -f "$config_file" ]] || fail "Not configured. Run: jenkins-batch setup"
 }
 
 jobs_command() {

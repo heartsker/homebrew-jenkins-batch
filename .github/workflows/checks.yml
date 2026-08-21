@@ -20,6 +20,8 @@ jobs:
         run: |
           bin/jenkins-batch version
           bin/jenkins-batch help
+          bin/jenkins-batch help | grep -q '^  jenkins-batch setup$'
+          ! bin/jenkins-batch help | grep -Eq 'setup --|config wizard'
           smoke_dir="$(mktemp -d)"
           mkdir -p "$smoke_dir/bin"
           cat > "$smoke_dir/bin/security" <<'EOF'
@@ -40,10 +42,10 @@ jobs:
           EOF
           chmod +x "$smoke_dir/bin/security"
           chmod +x "$smoke_dir/bin/curl"
-          printf 'ci-user\njenkins-token\njira-token\n' | \
+          printf '1\nexamples/config.example.json\nci-user\njenkins-token\njira-token\nq\n' | \
             PATH="$smoke_dir/bin:$PATH" \
             JENKINS_BATCH_CONFIG="$smoke_dir/config.json" \
-            bin/jenkins-batch setup --config examples/config.example.json
+            bin/jenkins-batch setup
           jq -e '.jenkins.user == "ci-user" and .issueTracker.user == "ci-user"' \
             "$smoke_dir/config.json"
           PATH="$smoke_dir/bin:$PATH" \
@@ -59,9 +61,10 @@ jobs:
             JENKINS_BATCH_CONFIG="$smoke_dir/config.json" \
             bin/jenkins-batch run feature/APP-123-demo --all --dry-run
           cp "$smoke_dir/config.json" "$smoke_dir/before-wizard.json"
-          printf '1\nhttps://ci.example.com\nb\ny\n' | \
+          printf '1\n1\nhttps://ci.example.com\nb\ns\n' | \
+            PATH="$smoke_dir/bin:$PATH" \
             JENKINS_BATCH_CONFIG="$smoke_dir/config.json" \
-            bin/jenkins-batch config wizard jenkins
+            bin/jenkins-batch setup
           jq -e '
             .jenkins.url == "https://ci.example.com" and
             .jenkins.tokenUrl == "https://ci.example.com/me/configure" and
@@ -73,9 +76,10 @@ jobs:
             ($after | del(.jenkins.url, .jenkins.tokenUrl, .jobs[].url))
           ' "$smoke_dir/before-wizard.json" "$smoke_dir/config.json"
           cp "$smoke_dir/config.json" "$smoke_dir/before-job-wizard.json"
-          printf '1\n3\nb\nb\ny\n' | \
+          printf '4\n1\n3\nb\nb\ns\n' | \
+            PATH="$smoke_dir/bin:$PATH" \
             JENKINS_BATCH_CONFIG="$smoke_dir/config.json" \
-            bin/jenkins-batch config wizard jobs
+            bin/jenkins-batch setup
           jq -e '.jobs[0].enabledByDefault == false' "$smoke_dir/config.json"
           jq -e --slurp '
             .[0] as $before | .[1] as $after |

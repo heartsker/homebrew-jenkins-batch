@@ -10,31 +10,13 @@ brew install heartsker/jenkins-batch/jenkins-batch
 
 ## Setup
 
-Use a shared, secret-free config:
-
-```sh
-jenkins-batch setup --config team.json
-```
-
-Setup imports the file, asks for `{{user}}` if present, then asks for Jenkins
-and Jira tokens. Token creation links are read from the config and printed next
-to each prompt. Tokens go to macOS Keychain, never to JSON.
-
-Without a shared config:
-
 ```sh
 jenkins-batch setup
 ```
 
-`run` starts this wizard automatically when no config exists. Each job has a
-name, Jenkins URL, parameters, and a default-enabled flag.
-
-Replace one token:
-
-```sh
-jenkins-batch setup --jenkins
-jenkins-batch setup --issue
-```
+The wizard shows the current setup and lets you import a shared config, edit
+one section or job, and replace tokens. Tokens go to macOS Keychain, never to
+JSON. `run` opens the same setup when no config exists.
 
 ## Use
 
@@ -54,17 +36,6 @@ jenkins-batch doctor
 ```text
 ~/.config/jenkins-batch/config.json
 ```
-
-Edit it without opening JSON:
-
-```sh
-jenkins-batch config wizard
-jenkins-batch config wizard jobs
-jenkins-batch config wizard jenkins
-```
-
-The wizard edits one field or section at a time, shows a summary before saving,
-and can quit without changing the current config.
 
 Share [`examples/config.example.json`](examples/config.example.json) as a
 starting point. It must not contain tokens or passwords; setup rejects them.

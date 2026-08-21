@@ -1,8 +1,8 @@
 class JenkinsBatch < Formula
   desc "Launch a configured group of Jenkins jobs"
   homepage "https://github.com/heartsker/homebrew-jenkins-batch"
-  url "https://github.com/heartsker/homebrew-jenkins-batch/releases/download/v0.3.0/jenkins-batch-0.3.0.tar.gz"
-  sha256 "2b576afcf6f98a99921bda2c5b487bf7670ee5a007d830f108ebe931e4797f4a"
+  url "https://github.com/heartsker/homebrew-jenkins-batch/releases/download/v0.4.0/jenkins-batch-0.4.0.tar.gz"
+  sha256 "0fe483232c847febda6d4a5e43ec7206c024cc7b3d40d455957be73a60c26bc4"
   license "MIT"
 
   depends_on "jq"
@@ -13,7 +13,7 @@ class JenkinsBatch < Formula
   end
 
   test do
-    assert_match "jenkins-batch 0.3.0", shell_output("#{bin}/jenkins-batch version")
+    assert_match "jenkins-batch 0.4.0", shell_output("#{bin}/jenkins-batch version")
     assert_match "jenkins-batch setup", shell_output("#{bin}/jenkins-batch help setup")
   end
 end
