@@ -20,6 +20,7 @@ jobs:
         run: |
           bin/jenkins-batch version
           bin/jenkins-batch help
+          bin/jenkins-batch help setup | grep -q 'arrow keys and Enter'
           bin/jenkins-batch help | grep -q '^  jenkins-batch setup$'
           ! bin/jenkins-batch help | grep -Eq 'setup --|config wizard'
           smoke_dir="$(mktemp -d)"
@@ -85,3 +86,11 @@ jobs:
             .[0] as $before | .[1] as $after |
             ($before | .jobs[0].enabledByDefault = false) == $after
           ' "$smoke_dir/before-job-wizard.json" "$smoke_dir/config.json"
+          jq '.jobs[0].enabledByDefault = true' \
+            "$smoke_dir/config.json" > "$smoke_dir/arrow-config.json"
+          printf '\033[B\033[B\033[B\r\r\033[B\033[B\r\033[A\r\033[A\r\033[A\033[A\r' | \
+            script -q /dev/null env \
+              PATH="$smoke_dir/bin:$PATH" \
+              JENKINS_BATCH_CONFIG="$smoke_dir/arrow-config.json" \
+              bin/jenkins-batch setup >/dev/null
+          jq -e '.jobs[0].enabledByDefault == false' "$smoke_dir/arrow-config.json"

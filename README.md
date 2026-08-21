@@ -16,7 +16,8 @@ jenkins-batch setup
 
 The wizard shows the current setup and lets you import a shared config, edit
 one section or job, and replace tokens. Tokens go to macOS Keychain, never to
-JSON. `run` opens the same setup when no config exists.
+JSON. Navigate with arrow keys and Enter. `run` opens the same setup when no
+config exists.
 
 ## Use
 

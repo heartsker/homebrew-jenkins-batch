@@ -5,7 +5,7 @@ setopt PIPE_FAIL
 unsetopt BG_NICE
 
 readonly APP_NAME="jenkins-batch"
-readonly APP_VERSION="0.4.0"
+readonly APP_VERSION="0.5.0"
 readonly SCRIPT_PATH="${0:A}"
 readonly JENKINS_KEYCHAIN_SERVICE="io.github.heartsker.jenkins-batch.jenkins"
 readonly ISSUE_KEYCHAIN_SERVICE="io.github.heartsker.jenkins-batch.issue-tracker"
@@ -24,6 +24,10 @@ typeset -g ui_bold=""
 typeset -g ui_dim=""
 typeset -g ui_accent=""
 typeset -g ui_reset=""
+typeset -g menu_choice=""
+typeset -ga menu_keys=()
+typeset -ga menu_labels=()
+typeset -ga menu_values=()
 
 typeset -g jenkins_url=""
 typeset -g jenkins_user=""
@@ -78,7 +82,7 @@ help_setup() {
 jenkins-batch setup
 
 Opens one wizard for importing or editing config, managing jobs, and replacing
-Jenkins or issue tracker tokens.
+Jenkins or issue tracker tokens. Use arrow keys and Enter to navigate.
 
 Config: ~/.config/jenkins-batch/config.json
 Tokens: macOS Keychain
@@ -139,6 +143,7 @@ note() {
 }
 
 cleanup() {
+  [[ -t 2 ]] && print -nu2 -- $'\e[?25h'
   if [[ -n "$runtime_dir" && -d "$runtime_dir" ]]; then
     rm -rf -- "$runtime_dir"
   fi
@@ -230,6 +235,86 @@ read_choice() {
   local value=""
   read "value?Select: " || { print -- "q"; return; }
   print -r -- "$value"
+}
+
+menu_reset() {
+  menu_choice=""
+  menu_keys=()
+  menu_labels=()
+  menu_values=()
+}
+
+menu_add() {
+  menu_keys+=("$1")
+  menu_labels+=("$2")
+  menu_values+=("${3:-}")
+}
+
+menu_render() {
+  local selected="$1"
+  local index label value
+  for (( index = 1; index <= ${#menu_keys[@]}; index += 1 )); do
+    label="${menu_labels[$index]}"
+    value="${menu_values[$index]}"
+    print -n -- $'\r\e[2K'
+    if (( index == selected )); then
+      printf '  %s› %-18s%s %s%s%s\n' \
+        "$ui_accent$ui_bold" "$label" "$ui_reset" "$ui_dim" "$value" "$ui_reset"
+    else
+      printf '    %-18s %s%s%s\n' "$label" "$ui_dim" "$value" "$ui_reset"
+    fi
+  done
+}
+
+menu_select() {
+  local count="${#menu_keys[@]}"
+  local selected=1 key rest index
+  (( count > 0 )) || fail "Empty menu"
+
+  if [[ ! -t 0 || ! -t 1 ]]; then
+    for (( index = 1; index <= count; index += 1 )); do
+      ui_item "${menu_keys[$index]}" "${menu_labels[$index]}" "${menu_values[$index]}"
+    done
+    menu_choice="$(read_choice)"
+    return
+  fi
+
+  print -- "${ui_dim}  ↑/↓ move · enter select${ui_reset}"
+  print -n -- $'\e[?25l'
+  menu_render "$selected"
+  while true; do
+    key=""
+    IFS= read -rs -k 1 key || { menu_choice="q"; break; }
+    if [[ "$key" == $'\e' ]]; then
+      rest=""
+      IFS= read -rs -k 2 -t 0.2 rest || true
+      key+="$rest"
+    fi
+    case "$key" in
+      $'\e[A'|k|K)
+        (( selected = selected == 1 ? count : selected - 1 ))
+        ;;
+      $'\e[B'|j|J)
+        (( selected = selected == count ? 1 : selected + 1 ))
+        ;;
+      ''|$'\r'|$'\n')
+        menu_choice="${menu_keys[$selected]}"
+        break
+        ;;
+      *)
+        for (( index = 1; index <= count; index += 1 )); do
+          if [[ "$key" == "${menu_keys[$index]}" && "$key" != <-> ]]; then
+            menu_choice="$key"
+            break 2
+          fi
+        done
+        continue
+        ;;
+    esac
+    printf '\e[%dA' "$count"
+    menu_render "$selected"
+  done
+  print -n -- $'\e[?25h'
 }
 
 prompt_secret() {
@@ -576,10 +661,12 @@ setup_interactive() {
     print -- "  Config stores links, jobs, and runtime settings."
     print -- "  Tokens stay in macOS Keychain."
     print
-    ui_item 1 "Import config" "team JSON"
-    ui_item 2 "Manual setup"
-    ui_item q "Quit"
-    choice="$(read_choice)"
+    menu_reset
+    menu_add 1 "Import config" "team JSON"
+    menu_add 2 "Manual setup"
+    menu_add q "Quit"
+    menu_select
+    choice="$menu_choice"
     case "$choice" in
       1)
         source_file="$(prompt_required "Config file")"
@@ -927,14 +1014,16 @@ edit_jenkins_menu() {
   local choice value old_url new_url token_url index job_count job_path_value job_url
   while true; do
     ui_title "Jenkins"
-    ui_item 1 "URL" "$(jq -r '.jenkins.url' "$file")"
-    ui_item 2 "Username" "$(jq -r '.jenkins.user' "$file")"
-    ui_item 3 "Token page" "$(jq -r '.jenkins.tokenUrl // empty' "$file")"
+    menu_reset
+    menu_add 1 "URL" "$(jq -r '.jenkins.url' "$file")"
+    menu_add 2 "Username" "$(jq -r '.jenkins.user' "$file")"
+    menu_add 3 "Token page" "$(jq -r '.jenkins.tokenUrl // empty' "$file")"
     value="verified"
     [[ "$(jq -r '.jenkins.insecure // false' "$file")" == "true" ]] && value="disabled"
-    ui_item 4 "TLS verification" "$value"
-    ui_item b "Back"
-    choice="$(read_choice)"
+    menu_add 4 "TLS verification" "$value"
+    menu_add b "Back"
+    menu_select
+    choice="$menu_choice"
     case "$choice" in
       1)
         old_url="$(jq -r '.jenkins.url' "$file")"
@@ -979,13 +1068,15 @@ edit_repository_menu() {
   local choice value
   while true; do
     ui_title "Repository"
-    ui_item 1 "Local path" "$(jq -r '.repository.path' "$file")"
-    ui_item 2 "Git remote" "$(jq -r '.repository.remote // "origin"' "$file")"
-    ui_item 3 "Branch owner" "$(jq -r '.repository.branchOwner // empty' "$file")"
-    ui_item 4 "Branch parameter" "$(jq -r '.repository.branchParameter // empty' "$file")"
-    ui_item 5 "Issue key regex" "$(jq -r '.repository.ticketPattern // empty' "$file")"
-    ui_item b "Back"
-    choice="$(read_choice)"
+    menu_reset
+    menu_add 1 "Local path" "$(jq -r '.repository.path' "$file")"
+    menu_add 2 "Git remote" "$(jq -r '.repository.remote // "origin"' "$file")"
+    menu_add 3 "Branch owner" "$(jq -r '.repository.branchOwner // empty' "$file")"
+    menu_add 4 "Branch parameter" "$(jq -r '.repository.branchParameter // empty' "$file")"
+    menu_add 5 "Issue key regex" "$(jq -r '.repository.ticketPattern // empty' "$file")"
+    menu_add b "Back"
+    menu_select
+    choice="$menu_choice"
     case "$choice" in
       1)
         value="$(prompt_required "Local repository" "$(jq -r '.repository.path' "$file")")"
@@ -1020,18 +1111,20 @@ edit_issue_menu() {
     state="disabled"
     [[ "$(jq -r '.issueTracker.enabled // false' "$file")" == "true" ]] && state="enabled"
     ui_title "Issue tracker"
-    ui_item 1 "Integration" "$state"
-    ui_item 2 "Browse URL" "$(jq -r '.issueTracker.browseUrl // empty' "$file")"
-    ui_item 3 "API URL" "$(jq -r '.issueTracker.apiUrl // empty' "$file")"
-    ui_item 4 "Username" "$(jq -r '.issueTracker.user // empty' "$file")"
-    ui_item 5 "Token page" "$(jq -r '.issueTracker.tokenUrl // empty' "$file")"
-    ui_item 6 "Auth mode" "$(jq -r '.issueTracker.authMode // "auto"' "$file")"
-    ui_item 7 "Job parameter" "$(jq -r '.issueTracker.jobParameter // empty' "$file")"
+    menu_reset
+    menu_add 1 "Integration" "$state"
+    menu_add 2 "Browse URL" "$(jq -r '.issueTracker.browseUrl // empty' "$file")"
+    menu_add 3 "API URL" "$(jq -r '.issueTracker.apiUrl // empty' "$file")"
+    menu_add 4 "Username" "$(jq -r '.issueTracker.user // empty' "$file")"
+    menu_add 5 "Token page" "$(jq -r '.issueTracker.tokenUrl // empty' "$file")"
+    menu_add 6 "Auth mode" "$(jq -r '.issueTracker.authMode // "auto"' "$file")"
+    menu_add 7 "Job parameter" "$(jq -r '.issueTracker.jobParameter // empty' "$file")"
     state="verified"
     [[ "$(jq -r '.issueTracker.insecure // false' "$file")" == "true" ]] && state="disabled"
-    ui_item 8 "TLS verification" "$state"
-    ui_item b "Back"
-    choice="$(read_choice)"
+    menu_add 8 "TLS verification" "$state"
+    menu_add b "Back"
+    menu_select
+    choice="$menu_choice"
     case "$choice" in
       1) update_config_json "$file" '.issueTracker.enabled = ((.issueTracker.enabled // false) | not)' || fail "Could not update integration" ;;
       2)
@@ -1073,12 +1166,14 @@ edit_runtime_menu() {
   local choice value
   while true; do
     ui_title "Runtime"
-    ui_item 1 "Queue timeout" "$(jq -r '.jenkins.queueTimeout // 1800' "$file")s"
-    ui_item 2 "Build timeout" "$(jq -r '.jenkins.buildTimeout // 21600' "$file")s"
-    ui_item 3 "Poll interval" "$(jq -r '.jenkins.pollInterval // 30' "$file")s"
-    ui_item 4 "Log directory" "$(jq -r '.logDirectory // "~/Library/Logs/jenkins-batch"' "$file")"
-    ui_item b "Back"
-    choice="$(read_choice)"
+    menu_reset
+    menu_add 1 "Queue timeout" "$(jq -r '.jenkins.queueTimeout // 1800' "$file")s"
+    menu_add 2 "Build timeout" "$(jq -r '.jenkins.buildTimeout // 21600' "$file")s"
+    menu_add 3 "Poll interval" "$(jq -r '.jenkins.pollInterval // 30' "$file")s"
+    menu_add 4 "Log directory" "$(jq -r '.logDirectory // "~/Library/Logs/jenkins-batch"' "$file")"
+    menu_add b "Back"
+    menu_select
+    choice="$menu_choice"
     case "$choice" in
       1|2|3)
         local field label current
@@ -1129,16 +1224,18 @@ edit_job_menu() {
     label="$(jq -r ".jobs[$config_index].label" "$file")"
     enabled="$(jq -r ".jobs[$config_index] | if has(\"enabledByDefault\") then .enabledByDefault else true end" "$file")"
     ui_title "Job · $label"
-    ui_item 1 "Name" "$label"
-    ui_item 2 "Jenkins URL" "$(jq -r ".jobs[$config_index].url // empty" "$file")"
-    ui_item 3 "Default" "$([[ "$enabled" == "true" ]] && print enabled || print optional)"
+    menu_reset
+    menu_add 1 "Name" "$label"
+    menu_add 2 "Jenkins URL" "$(jq -r ".jobs[$config_index].url // empty" "$file")"
+    menu_add 3 "Default" "$([[ "$enabled" == "true" ]] && print enabled || print optional)"
     parameters="$(jq -r ".jobs[$config_index].parameters // {} | to_entries | map(.key + \"=\" + (.value | tostring)) | join(\",\")" "$file")"
-    ui_item 4 "Parameters" "${parameters:-none}"
+    menu_add 4 "Parameters" "${parameters:-none}"
     regex="$(jq -r ".jobs[$config_index].linkRegex // empty" "$file")"
-    ui_item 5 "Result link" "${regex:-disabled}"
-    ui_item d "Delete"
-    ui_item b "Back"
-    choice="$(read_choice)"
+    menu_add 5 "Result link" "${regex:-disabled}"
+    menu_add d "Delete"
+    menu_add b "Back"
+    menu_select
+    choice="$menu_choice"
     case "$choice" in
       1)
         value="$(prompt_required "Name" "$label")"
@@ -1185,20 +1282,20 @@ edit_job_menu() {
 
 edit_jobs_menu() {
   local file="$1"
-  local choice count index label enabled url
+  local choice count index label enabled
   while true; do
     count="$(jq -r '.jobs | length' "$file")"
     ui_title "Jobs"
+    menu_reset
     for (( index = 1; index <= count; index += 1 )); do
       label="$(jq -r ".jobs[$(( index - 1 ))].label" "$file")"
       enabled="$(jq -r ".jobs[$(( index - 1 ))] | if has(\"enabledByDefault\") then .enabledByDefault else true end" "$file")"
-      ui_item "$index" "$label" "$([[ "$enabled" == "true" ]] && print default || print optional)"
-      url="$(jq -r ".jobs[$(( index - 1 ))].url // empty" "$file")"
-      [[ -n "$url" ]] && print -- "      ${ui_dim}$url${ui_reset}"
+      menu_add "$index" "$label" "$([[ "$enabled" == "true" ]] && print default || print optional)"
     done
-    ui_item a "Add job"
-    ui_item b "Back"
-    choice="$(read_choice)"
+    menu_add a "Add job"
+    menu_add b "Back"
+    menu_select
+    choice="$menu_choice"
     case "$choice" in
       a|A) add_job_wizard "$file" ;;
       b|B|q|Q) return ;;
@@ -1290,25 +1387,27 @@ config_edit_wizard() {
     ui_title "$title"
     [[ "$setup_mode" == "true" ]] && print -- "  ${ui_dim}Config: $config_file${ui_reset}"
     [[ "$setup_mode" == "true" ]] && print
-    ui_item 1 "Jenkins" "$(jq -r '.jenkins.url' "$working")"
-    ui_item 2 "Repository" "$(jq -r '.repository.path' "$working")"
-    ui_item 3 "Issue tracker" "$issue_state"
-    ui_item 4 "Jobs" "$job_count total · $default_count default"
-    ui_item 5 "Runtime" "poll $(jq -r '.jenkins.pollInterval // 30' "$working")s"
+    menu_reset
+    menu_add 1 "Jenkins" "$(jq -r '.jenkins.url' "$working")"
+    menu_add 2 "Repository" "$(jq -r '.repository.path' "$working")"
+    menu_add 3 "Issue tracker" "$issue_state"
+    menu_add 4 "Jobs" "$job_count total · $default_count default"
+    menu_add 5 "Runtime" "poll $(jq -r '.jenkins.pollInterval // 30' "$working")s"
     if [[ "$setup_mode" == "true" ]]; then
       jenkins_credential="$(credential_state "$JENKINS_KEYCHAIN_SERVICE" "$(jq -r '.jenkins.user' "$working")")"
       issue_credential="disabled"
       [[ "$issue_state" != "enabled" ]] \
         || issue_credential="$(credential_state "$ISSUE_KEYCHAIN_SERVICE" "$(jq -r '.issueTracker.user // empty' "$working")")"
-      ui_item 6 "Jenkins token" "$jenkins_credential"
-      ui_item 7 "Issue token" "$issue_credential"
-      ui_item i "Import config" "team JSON"
-      ui_item s "Save & done"
+      menu_add 6 "Jenkins token" "$jenkins_credential"
+      menu_add 7 "Issue token" "$issue_credential"
+      menu_add i "Import config" "team JSON"
+      menu_add s "Save & done"
     else
-      ui_item s "Save & exit"
+      menu_add s "Save & exit"
     fi
-    ui_item q "Quit"
-    choice="$(read_choice)"
+    menu_add q "Quit"
+    menu_select
+    choice="$menu_choice"
     case "$choice" in
       1) edit_jenkins_menu "$working" ;;
       2) edit_repository_menu "$working" ;;
