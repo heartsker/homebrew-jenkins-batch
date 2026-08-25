@@ -21,37 +21,69 @@ jobs:
           bin/jenkins-batch version
           bin/jenkins-batch help
           bin/jenkins-batch help setup | grep -q 'arrow keys and Enter'
-          bin/jenkins-batch help | grep -q '^  jenkins-batch setup$'
+          bin/jenkins-batch help | grep -q '^  setup    Configure jobs and credentials$'
+          bin/jenkins-batch help | grep -q '^  status   Watch, cancel, or retry builds$'
+          ! bin/jenkins-batch help | grep -q 'jenkins-batch jobs'
           ! bin/jenkins-batch help | grep -Eq 'setup --|config wizard'
           smoke_dir="$(mktemp -d)"
           mkdir -p "$smoke_dir/bin"
           cat > "$smoke_dir/bin/security" <<'EOF'
           #!/bin/sh
+          case "$*" in
+            *find-generic-password*) printf 'test-token' ;;
+          esac
           exit 0
           EOF
           cat > "$smoke_dir/bin/curl" <<'EOF'
           #!/bin/sh
           output=""
+          headers=""
+          url=""
           while [ "$#" -gt 0 ]; do
             case "$1" in
               --output) output="$2"; shift 2 ;;
+              --dump-header) headers="$2"; shift 2 ;;
+              http://*|https://*) url="$1"; shift ;;
               *) shift ;;
             esac
           done
-          printf '{"authenticated":true,"name":"ci-user"}' > "$output"
-          printf '200'
+          body='{}'
+          code='200'
+          case "$url" in
+            */whoAmI/api/json) body='{"authenticated":true,"name":"ci-user"}' ;;
+            */crumbIssuer/api/json) code='404' ;;
+            */queue/item/102/api/json*)
+              body='{"cancelled":false,"executable":{"url":"https://jenkins.example.com/job/Mobile/job/Simulator/43/","number":43}}'
+              ;;
+            */43/api/json*) body='{"building":true,"result":null,"number":43}' ;;
+            */buildWithParameters|*/build)
+              code='201'
+              [ -z "$headers" ] || printf 'Location: https://jenkins.example.com/queue/item/102/\r\n' > "$headers"
+              ;;
+            */stop|*/queue/cancelItem) code='200' ;;
+            *) code='404' ;;
+          esac
+          [ -z "$output" ] || printf '%s' "$body" > "$output"
+          printf '%s' "$code"
+          EOF
+          cat > "$smoke_dir/bin/launchctl" <<'EOF'
+          #!/bin/sh
+          exit 0
           EOF
           chmod +x "$smoke_dir/bin/security"
           chmod +x "$smoke_dir/bin/curl"
+          chmod +x "$smoke_dir/bin/launchctl"
           printf '1\nexamples/config.example.json\nci-user\njenkins-token\njira-token\nq\n' | \
             PATH="$smoke_dir/bin:$PATH" \
             JENKINS_BATCH_CONFIG="$smoke_dir/config.json" \
             bin/jenkins-batch setup
           jq -e '.jenkins.user == "ci-user" and .issueTracker.user == "ci-user"' \
             "$smoke_dir/config.json"
+          cp "$smoke_dir/config.json" "$smoke_dir/status-config.json"
           PATH="$smoke_dir/bin:$PATH" \
             JENKINS_BATCH_CONFIG="$smoke_dir/config.json" \
-            bin/jenkins-batch jobs
+            JENKINS_BATCH_STATE="$smoke_dir/state.json" \
+            bin/jenkins-batch status
           PATH="$smoke_dir/bin:$PATH" \
             JENKINS_BATCH_CONFIG="$smoke_dir/config.json" \
             bin/jenkins-batch run feature/APP-123-demo --dry-run --verbose
@@ -61,6 +93,10 @@ jobs:
           PATH="$smoke_dir/bin:$PATH" \
             JENKINS_BATCH_CONFIG="$smoke_dir/config.json" \
             bin/jenkins-batch run feature/APP-123-demo --all --dry-run
+          printf '\033[B \r' | script -q /dev/null env \
+            PATH="$smoke_dir/bin:$PATH" \
+            JENKINS_BATCH_CONFIG="$smoke_dir/config.json" \
+            bin/jenkins-batch run feature/APP-123-demo --select --dry-run >/dev/null
           cp "$smoke_dir/config.json" "$smoke_dir/before-wizard.json"
           printf '1\n1\nhttps://ci.example.com\nb\ns\n' | \
             PATH="$smoke_dir/bin:$PATH" \
@@ -94,3 +130,50 @@ jobs:
               JENKINS_BATCH_CONFIG="$smoke_dir/arrow-config.json" \
               bin/jenkins-batch setup >/dev/null
           jq -e '.jobs[0].enabledByDefault == false' "$smoke_dir/arrow-config.json"
+          jq -n '{
+            version: 1,
+            builds: [{
+              id: "failed-1",
+              jenkinsUrl: "https://jenkins.example.com",
+              jobConfigIndex: 1,
+              jobLabel: "Simulator QA",
+              jobPath: "Mobile/Simulator",
+              branch: "feature/APP-123-demo",
+              issueKey: "APP-123",
+              comments: false,
+              parameters: ["sourceBranch=feature/APP-123-demo", "BUILD_CONFIGURATION=QA"],
+              status: "FAILURE",
+              result: "FAILURE",
+              queueUrl: null,
+              queueId: null,
+              buildUrl: "https://jenkins.example.com/job/Mobile/job/Simulator/40/",
+              buildNumber: 40,
+              retryOf: null,
+              attempt: 1,
+              createdAt: "2026-08-25T08:00:00Z",
+              createdEpoch: 1770000003,
+              updatedAt: "2026-08-25T08:00:00Z"
+            }]
+          }' > "$smoke_dir/state.json"
+          PATH="$smoke_dir/bin:$PATH" \
+            JENKINS_BATCH_CONFIG="$smoke_dir/status-config.json" \
+            JENKINS_BATCH_STATE="$smoke_dir/state.json" \
+            bin/jenkins-batch status --json > "$smoke_dir/status.json"
+          jq -e 'length == 1 and .[0].status == "FAILURE"' "$smoke_dir/status.json"
+          printf '\r\r\nq' | script -q /dev/null env \
+            PATH="$smoke_dir/bin:$PATH" \
+            JENKINS_BATCH_CONFIG="$smoke_dir/status-config.json" \
+            JENKINS_BATCH_STATE="$smoke_dir/state.json" \
+            bin/jenkins-batch status >/dev/null
+          jq -e '
+            [.builds[] | select(.retryOf == "failed-1")]
+            | length == 1 and .[0].attempt == 2 and .[0].status == "RUNNING"
+          ' "$smoke_dir/state.json"
+          printf '\r\ry\nbq' | script -q /dev/null env \
+            PATH="$smoke_dir/bin:$PATH" \
+            JENKINS_BATCH_CONFIG="$smoke_dir/status-config.json" \
+            JENKINS_BATCH_STATE="$smoke_dir/state.json" \
+            bin/jenkins-batch status >/dev/null
+          jq -e '
+            [.builds[] | select(.retryOf == "failed-1")][0].status == "CANCELLING"
+          ' "$smoke_dir/state.json"

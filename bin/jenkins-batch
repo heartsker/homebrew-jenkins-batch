@@ -5,7 +5,7 @@ setopt PIPE_FAIL
 unsetopt BG_NICE
 
 readonly APP_NAME="jenkins-batch"
-readonly APP_VERSION="0.5.1"
+readonly APP_VERSION="0.6.0"
 readonly SCRIPT_PATH="${0:A}"
 readonly JENKINS_KEYCHAIN_SERVICE="io.github.heartsker.jenkins-batch.jenkins"
 readonly ISSUE_KEYCHAIN_SERVICE="io.github.heartsker.jenkins-batch.issue-tracker"
@@ -13,6 +13,7 @@ readonly ISSUE_KEYCHAIN_SERVICE="io.github.heartsker.jenkins-batch.issue-tracker
 umask 077
 
 typeset -g config_file="${JENKINS_BATCH_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/jenkins-batch/config.json}"
+typeset -g state_file="${JENKINS_BATCH_STATE:-${XDG_STATE_HOME:-$HOME/.local/state}/jenkins-batch/builds.json}"
 typeset -g runtime_dir=""
 typeset -g cookie_jar=""
 typeset -g crumb_header=""
@@ -23,12 +24,16 @@ typeset -g credential_check_detail=""
 typeset -g ui_bold=""
 typeset -g ui_dim=""
 typeset -g ui_accent=""
+typeset -g ui_success=""
+typeset -g ui_warning=""
+typeset -g ui_danger=""
 typeset -g ui_reset=""
 typeset -g menu_choice=""
 typeset -g menu_cursor_hidden="false"
 typeset -ga menu_keys=()
 typeset -ga menu_labels=()
 typeset -ga menu_values=()
+typeset -ga menu_choices=()
 
 typeset -g jenkins_url=""
 typeset -g jenkins_user=""
@@ -58,23 +63,19 @@ typeset -ga job_link_regexes=()
 typeset -ga job_enabled_defaults=()
 typeset -ga job_config_indices=()
 typeset -ga pipeline_urls=()
+typeset -ga run_state_ids=()
 
 help_main() {
   cat <<'HELP'
-jenkins-batch — launch a configured group of Jenkins jobs.
+jenkins-batch — run and manage Jenkins builds.
 
-Usage:
-  jenkins-batch setup
-  jenkins-batch run [TARGET ...] [options]
-  jenkins-batch cancel [TARGET ...] [options]
-  jenkins-batch jobs
-  jenkins-batch doctor
+Commands:
+  setup    Configure jobs and credentials
+  run      Start configured builds
+  status   Watch, cancel, or retry builds
+  doctor   Check local setup
 
-Start:
-  jenkins-batch setup
-  jenkins-batch run [--select|--job NAME|--all]
-
-More: jenkins-batch help <setup|run|cancel>
+Use: jenkins-batch help <setup|run|status>
 HELP
 }
 
@@ -110,6 +111,15 @@ Examples:
 HELP
 }
 
+help_status() {
+  cat <<'HELP'
+jenkins-batch status [--json]
+
+Shows builds started by this utility. Use arrow keys and Enter to inspect a
+build, cancel active work, or retry a failed task.
+HELP
+}
+
 help_cancel() {
   cat <<'HELP'
 jenkins-batch cancel [TARGET ...] [options]
@@ -128,6 +138,7 @@ show_help() {
   case "${1:-}" in
     setup) help_setup ;;
     run) help_run ;;
+    status) help_status ;;
     cancel) help_cancel ;;
     ""|help) help_main ;;
     *) fail "Unknown help topic: $1" ;;
@@ -215,6 +226,9 @@ init_ui() {
     ui_bold=$'\e[1m'
     ui_dim=$'\e[2m'
     ui_accent=$'\e[36m'
+    ui_success=$'\e[32m'
+    ui_warning=$'\e[33m'
+    ui_danger=$'\e[31m'
     ui_reset=$'\e[0m'
   fi
 }
@@ -243,6 +257,7 @@ menu_reset() {
   menu_keys=()
   menu_labels=()
   menu_values=()
+  menu_choices=()
 }
 
 menu_add() {
@@ -315,6 +330,63 @@ menu_select() {
     esac
     printf '\e[%dA' "$count"
     menu_render "$selected"
+  done
+  print -n -- $'\e[?25h'
+  menu_cursor_hidden="false"
+}
+
+menu_render_many() {
+  local selected="$1"
+  shift
+  local -a checked=("$@")
+  local index mark label value
+  for (( index = 1; index <= ${#menu_keys[@]}; index += 1 )); do
+    [[ "${checked[$index]:-false}" == "true" ]] && mark="●" || mark="○"
+    label="${menu_labels[$index]}"
+    value="${menu_values[$index]}"
+    print -n -- $'\r\e[2K'
+    if (( index == selected )); then
+      printf '  %s› %s %-16s%s %s%s%s\n' \
+        "$ui_accent$ui_bold" "$mark" "$label" "$ui_reset" "$ui_dim" "$value" "$ui_reset"
+    else
+      printf '    %s %-16s %s%s%s\n' "$mark" "$label" "$ui_dim" "$value" "$ui_reset"
+    fi
+  done
+}
+
+menu_select_many() {
+  local -a checked=("$@")
+  local count="${#menu_keys[@]}" selected=1 key rest index
+  menu_choice=""
+  menu_choices=()
+  print -- "${ui_dim}  ↑/↓ move · space toggle · enter run${ui_reset}"
+  print -n -- $'\e[?25l'
+  menu_cursor_hidden="true"
+  menu_render_many "$selected" "${checked[@]}"
+  while true; do
+    key=""
+    IFS= read -rs -k 1 key || break
+    if [[ "$key" == $'\e' ]]; then
+      rest=""
+      IFS= read -rs -k 2 -t 0.2 rest || true
+      key+="$rest"
+    fi
+    case "$key" in
+      $'\e[A'|k|K) (( selected = selected == 1 ? count : selected - 1 )) ;;
+      $'\e[B'|j|J) (( selected = selected == count ? 1 : selected + 1 )) ;;
+      ' ') [[ "${checked[$selected]:-false}" == "true" ]] && checked[$selected]="false" || checked[$selected]="true" ;;
+      ''|$'\r'|$'\n')
+        for (( index = 1; index <= count; index += 1 )); do
+          [[ "${checked[$index]:-false}" == "true" ]] && menu_choices+=("${menu_keys[$index]}")
+        done
+        menu_choice="done"
+        break
+        ;;
+      q|Q) menu_choice="q"; break ;;
+      *) continue ;;
+    esac
+    printf '\e[%dA' "$count"
+    menu_render_many "$selected" "${checked[@]}"
   done
   print -n -- $'\e[?25h'
   menu_cursor_hidden="false"
@@ -431,6 +503,131 @@ validate_config_file() {
     ) and
     (any(.. | strings; contains("{{user}}")) | not)
   ' "$file" >/dev/null 2>&1
+}
+
+state_init() {
+  local state_dir temporary
+  state_dir="$(dirname "$state_file")"
+  mkdir -p "$state_dir" || fail "Could not create state directory"
+  if [[ -f "$state_file" ]]; then
+    jq -e '.version == 1 and (.builds | type == "array")' "$state_file" >/dev/null 2>&1 \
+      || fail "Invalid state: $state_file"
+    return
+  fi
+  temporary="$(mktemp "$state_dir/builds.XXXXXX")" || fail "Could not create state"
+  jq -n '{version: 1, builds: []}' > "$temporary" || fail "Could not write state"
+  chmod 600 "$temporary"
+  mv -f "$temporary" "$state_file"
+}
+
+state_mutate() {
+  local filter="$1"
+  shift
+  local next_file="${state_file}.next.$$.$RANDOM"
+  local lock_dir="${state_file}.lock" attempts=0
+  while ! mkdir "$lock_dir" 2>/dev/null; do
+    (( attempts += 1 ))
+    (( attempts < 200 )) || fail "State is busy; try again"
+    sleep 0.05
+  done
+  jq "$@" "$filter" "$state_file" > "$next_file" || {
+    rm -f -- "$next_file"
+    rmdir "$lock_dir" 2>/dev/null
+    return 1
+  }
+  chmod 600 "$next_file"
+  mv -f "$next_file" "$state_file"
+  rmdir "$lock_dir" 2>/dev/null
+}
+
+state_parameters_json() {
+  jq -cn --args '$ARGS.positional' "$@"
+}
+
+state_add_build() {
+  local index="$1" branch="$2" issue_key="$3" comments="$4" parameters="$5"
+  local retry_of="${6:-}" attempt="${7:-1}"
+  local epoch created id config_index
+  epoch="$(date +%s)"
+  created="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+  id="build-$epoch-$$-$RANDOM"
+  config_index="${job_config_indices[$index]}"
+  state_mutate '
+    .builds = ([{
+      id: $id,
+      jenkinsUrl: $jenkinsUrl,
+      jobConfigIndex: $configIndex,
+      jobLabel: $label,
+      jobPath: $path,
+      branch: $branch,
+      issueKey: $issueKey,
+      comments: $comments,
+      parameters: $parameters,
+      status: "QUEUEING",
+      result: null,
+      queueUrl: null,
+      queueId: null,
+      buildUrl: null,
+      buildNumber: null,
+      retryOf: (if $retryOf == "" then null else $retryOf end),
+      attempt: $attempt,
+      createdAt: $createdAt,
+      createdEpoch: $createdEpoch,
+      updatedAt: $createdAt
+    }] + .builds)[:100]
+  ' \
+    --arg id "$id" \
+    --arg jenkinsUrl "$jenkins_url" \
+    --argjson configIndex "$config_index" \
+    --arg label "${job_labels[$index]}" \
+    --arg path "${job_paths[$index]}" \
+    --arg branch "$branch" \
+    --arg issueKey "$issue_key" \
+    --argjson comments "$comments" \
+    --argjson parameters "$parameters" \
+    --arg retryOf "$retry_of" \
+    --argjson attempt "$attempt" \
+    --arg createdAt "$created" \
+    --argjson createdEpoch "$epoch" \
+    || fail "Could not save build state"
+  print -r -- "$id"
+}
+
+state_patch_build() {
+  local id="$1" patch="$2"
+  local updated
+  updated="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+  state_mutate '
+    .builds |= map(
+      if .id == $id then . + $patch + {updatedAt: $updatedAt} else . end
+    )
+  ' --arg id "$id" --argjson patch "$patch" --arg updatedAt "$updated" \
+    || fail "Could not update build state"
+}
+
+state_build_json() {
+  jq -c --arg id "$1" '.builds[] | select(.id == $id)' "$state_file"
+}
+
+state_url_is_safe() {
+  local url="$1"
+  local origin
+  origin="$(print -r -- "$jenkins_url" | sed -E 's#^(https?://[^/]+).*$#\1#')"
+  [[ -n "$url" && ( "$url" == "$origin" || "$url" == "$origin/"* ) ]]
+}
+
+state_status_is_active() {
+  case "$1" in
+    QUEUEING|QUEUED|RUNNING|CANCELLING|UNKNOWN) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+state_status_is_retryable() {
+  case "$1" in
+    FAILURE|ABORTED|CANCELLED|ERROR|UNSTABLE|NOT_BUILT|TIMEOUT) return 0 ;;
+    *) return 1 ;;
+  esac
 }
 
 default_issue_token_url() {
@@ -680,7 +877,6 @@ setup_interactive() {
       *) note "Unknown choice" ;;
     esac
   done
-  config_edit_wizard "" true
 }
 
 job_path_from_input() {
@@ -961,9 +1157,9 @@ setup_wizard() {
 
   if [[ "$edit_mode" == "true" ]]; then
     [[ "$previous_jenkins_user" == "$setup_jenkins_user" ]] \
-      || print -- "Run: jenkins-batch setup --jenkins"
+      || print -- "Run setup again to update the Jenkins token."
     [[ "$setup_issue_enabled" != "true" || "$previous_issue_user" == "$setup_issue_user" ]] \
-      || print -- "Run: jenkins-batch setup --issue"
+      || print -- "Run setup again to update the issue token."
   else
     save_setup_credentials "$config_file"
   fi
@@ -1007,9 +1203,9 @@ save_wizard_config() {
   mv -f "$temporary_config" "$config_file"
   print -- "Saved."
   [[ "$old_jenkins_user" == "$new_jenkins_user" ]] \
-    || print -- "Run: jenkins-batch setup --jenkins"
+    || print -- "Run setup again to update the Jenkins token."
   [[ "$new_issue_enabled" != "true" || "$old_issue_user" == "$new_issue_user" ]] \
-    || print -- "Run: jenkins-batch setup --issue"
+    || print -- "Run setup again to update the issue token."
 }
 
 edit_jenkins_menu() {
@@ -1587,13 +1783,13 @@ doctor() {
     stored_jenkins_token="$(security find-generic-password -a "$jenkins_user" -s "$JENKINS_KEYCHAIN_SERVICE" -w 2>/dev/null)"
   fi
   if [[ -z "$stored_jenkins_token" ]]; then
-    print -- "✗ Jenkins credential — run: jenkins-batch setup --jenkins"
+    print -- "✗ Jenkins credential — open: jenkins-batch setup"
     (( failures += 1 ))
   elif check_jenkins_credential "$config_file" "$stored_jenkins_token"; then
     print -- "✓ Jenkins authentication — $jenkins_user"
   else
     print -- "✗ Jenkins authentication — $credential_check_detail"
-    print -- "  Run: jenkins-batch setup --jenkins"
+    print -- "  Open: jenkins-batch setup"
     (( failures += 1 ))
   fi
   if [[ "$issue_enabled" == "true" ]]; then
@@ -1632,19 +1828,6 @@ ensure_config() {
   print -- "No config. Starting setup."
   setup_interactive
   [[ -f "$config_file" ]] || fail "Not configured. Run: jenkins-batch setup"
-}
-
-jobs_command() {
-  local index config_index url state
-  for (( index = 1; index <= ${#job_labels[@]}; index += 1 )); do
-    config_index=$(( job_config_indices[$index] - 1 ))
-    url="$(jq -r ".jobs[$config_index].url // empty" "$config_file")"
-    [[ -n "$url" ]] || url="$(job_url_from_path "$jenkins_url" "${job_paths[$index]}")"
-    state="optional"
-    [[ "${job_enabled_defaults[$index]}" == "true" ]] && state="default"
-    print -- "$index. ${job_labels[$index]} [$state]"
-    print -- "   $url"
-  done
 }
 
 is_issue_key() {
@@ -1740,15 +1923,15 @@ print_plan() {
   [[ -n "$issue_key" ]] && print -- "Issue:  $issue_key"
   local index parameter
   local -a parameters=()
-  for (( index = 1; index <= ${#job_labels[@]}; index += 1 )); do
-    print -- "• ${job_labels[$index]} → ${job_paths[$index]}"
-    if [[ "$verbose" == "true" ]]; then
+  if [[ "$verbose" == "true" ]]; then
+    for (( index = 1; index <= ${#job_labels[@]}; index += 1 )); do
+      print -- "• ${job_labels[$index]} → ${job_paths[$index]}"
       parameters=("${(@f)$(build_parameters "$index" "$branch" "$issue_url")}")
       for parameter in "${parameters[@]}"; do
         [[ -n "$parameter" ]] && print -- "    $parameter"
       done
-    fi
-  done
+    done
+  fi
 }
 
 load_runtime() {
@@ -1943,23 +2126,40 @@ wait_for_starts() {
           pipeline_urls[$index]="$build_url"
           states[$index]="started"
           (( completed += 1 ))
+          if [[ -n "${run_state_ids[$index]:-}" ]]; then
+            state_patch_build "${run_state_ids[$index]}" \
+              "$(jq -cn --arg url "$build_url" --arg number "${${build_url%/}:t}" \
+                '{status: "RUNNING", buildUrl: $url, buildNumber: ($number | tonumber?)}')"
+          fi
           note "✓ ${job_labels[$index]}: $build_url"
           ;;
         2)
           states[$index]="cancelled"
           (( completed += 1, failures += 1 ))
+          [[ -z "${run_state_ids[$index]:-}" ]] \
+            || state_patch_build "${run_state_ids[$index]}" '{"status":"CANCELLED","result":"CANCELLED"}'
           note "✗ ${job_labels[$index]} was cancelled in the queue"
           ;;
         3) ;;
         *)
           states[$index]="failed"
           (( completed += 1, failures += 1 ))
+          [[ -z "${run_state_ids[$index]:-}" ]] \
+            || state_patch_build "${run_state_ids[$index]}" '{"status":"ERROR","result":"QUEUE_API_ERROR"}'
           note "✗ Could not read ${job_labels[$index]} queue state"
           ;;
       esac
     done
     (( completed == count )) && break
-    (( elapsed < queue_timeout )) || { note "Queue timeout after ${queue_timeout}s"; return 1; }
+    if (( elapsed >= queue_timeout )); then
+      for (( index = 1; index <= count; index += 1 )); do
+        if [[ "${states[$index]}" == "pending" && -n "${run_state_ids[$index]:-}" ]]; then
+          state_patch_build "${run_state_ids[$index]}" '{"status":"TIMEOUT","result":"QUEUE_TIMEOUT"}'
+        fi
+      done
+      note "Queue timeout after ${queue_timeout}s"
+      return 1
+    fi
     sleep 5
     (( elapsed += 5 ))
   done
@@ -1997,29 +2197,35 @@ run_one() {
   [[ "$comments" == "true" ]] && load_issue_token
   load_runtime
   prepare_jenkins_session
+  state_init
 
-  local index failures=0
+  local index failures=0 state_id queue_id parameters_json
   local -a queue_urls=() parameters=()
+  run_state_ids=()
   for (( index = 1; index <= ${#job_labels[@]}; index += 1 )); do
     parameters=("${(@f)$(build_parameters "$index" "$branch" "$issue_url")}")
-    note "Queueing ${job_labels[$index]}…"
+    parameters_json="$(state_parameters_json "${parameters[@]}")"
+    state_id="$(state_add_build "$index" "$branch" "$issue_key" "$comments" "$parameters_json")"
+    run_state_ids[$index]="$state_id"
     queue_urls[$index]="$(trigger_build "$index" "${parameters[@]}")" || {
       queue_urls[$index]=""
+      state_patch_build "$state_id" '{"status":"ERROR","result":"TRIGGER_FAILED"}'
       (( failures += 1 ))
+      continue
     }
+    queue_id="${${queue_urls[$index]%/}:t}"
+    state_patch_build "$state_id" \
+      "$(jq -cn --arg url "${queue_urls[$index]}" --arg id "$queue_id" \
+        '{status: "QUEUED", queueUrl: $url, queueId: $id}')"
   done
 
   wait_for_starts "${queue_urls[@]}" || (( failures += 1 ))
-  print
-  print -- "Started:"
-  for (( index = 1; index <= ${#job_labels[@]}; index += 1 )); do
-    [[ -n "${pipeline_urls[$index]:-}" ]] && print -- "  ${job_labels[$index]}: ${pipeline_urls[$index]}"
-  done
   (( failures == 0 )) || fail "Some jobs did not start"
 
   if [[ "$comments" == "true" ]]; then
     start_watchers "$branch" "$issue_key"
   fi
+  print -- "Open: jenkins-batch status"
   cleanup
 }
 
@@ -2074,7 +2280,8 @@ select_jobs_for_run() {
   local mode="$1"
   shift
   local -a selectors=("$@") selected=()
-  local index selector default_answer
+  local -a defaults=()
+  local index selector
   typeset -A seen
   case "$mode" in
     all)
@@ -2083,13 +2290,19 @@ select_jobs_for_run() {
       done
       ;;
     interactive)
-      [[ -t 0 ]] || fail "--select requires an interactive terminal"
-      print -- "Select jobs"
+      [[ -t 0 && -t 1 ]] || fail "--select requires an interactive terminal"
+      init_ui
+      ui_title "Choose builds"
+      menu_reset
       for (( index = 1; index <= ${#job_labels[@]}; index += 1 )); do
-        default_answer="no"
-        [[ "${job_enabled_defaults[$index]}" == "true" ]] && default_answer="yes"
-        confirm "${job_labels[$index]}?" "$default_answer" && selected+=("$index")
+        menu_add "$index" "${job_labels[$index]}" \
+          "$([[ "${job_enabled_defaults[$index]}" == "true" ]] && print default || print optional)"
+        defaults+=("${job_enabled_defaults[$index]}")
       done
+      menu_select_many "${defaults[@]}"
+      [[ "$menu_choice" != "q" ]] || return 2
+      selected=("${menu_choices[@]}")
+      (( ${#selected[@]} > 0 )) || return 2
       ;;
     explicit)
       for selector in "${selectors[@]}"; do
@@ -2151,10 +2364,313 @@ run_command() {
   (( ${#targets[@]} == 1 )) || [[ -z "$issue_override" ]] \
     || fail "--issue can only be used with one target"
   select_jobs_for_run "$selection_mode" "${job_selectors[@]}"
+  local selection_result=$?
+  if (( selection_result == 2 )); then
+    print -- "Cancelled."
+    return
+  fi
+  (( selection_result == 0 )) || return "$selection_result"
   local target
   for target in "${targets[@]}"; do
     run_one "$target" "$issue_override" "$dry_run" "$comments" "$verbose" || return 1
   done
+}
+
+state_refresh_build() {
+  local id="$1"
+  local record build_state queue_url build_url body http_code cancelled result building number
+  record="$(state_build_json "$id")"
+  [[ -n "$record" ]] || return 1
+  [[ "$(jq -r '.jenkinsUrl' <<< "$record")" == "$jenkins_url" ]] || return 1
+  build_state="$(jq -r '.status' <<< "$record")"
+  state_status_is_active "$build_state" || return
+  queue_url="$(jq -r '.queueUrl // empty' <<< "$record")"
+  build_url="$(jq -r '.buildUrl // empty' <<< "$record")"
+
+  if [[ -n "$build_url" ]]; then
+    state_url_is_safe "$build_url" || return 1
+    body="$runtime_dir/status-$id.json"
+    http_code="$(api_get "${build_url%/}/api/json?tree=building,result,number,url" "$body")" || return 1
+    [[ "$http_code" == "200" ]] || return 1
+    building="$(jq -r '.building // false' "$body")"
+    number="$(jq -r '.number // empty' "$body")"
+    if [[ "$building" == "true" ]]; then
+      [[ "$build_state" == "CANCELLING" ]] || build_state="RUNNING"
+      state_patch_build "$id" \
+        "$(jq -cn --arg status "$build_state" --arg number "$number" \
+          '{status: $status, buildNumber: ($number | tonumber?)}')"
+    else
+      result="$(jq -r '.result // "UNKNOWN"' "$body")"
+      state_patch_build "$id" \
+        "$(jq -cn --arg result "$result" --arg number "$number" \
+          '{status: $result, result: $result, buildNumber: ($number | tonumber?)}')"
+    fi
+    return
+  fi
+
+  [[ -n "$queue_url" ]] || return
+  state_url_is_safe "$queue_url" || return 1
+  body="$runtime_dir/status-queue-$id.json"
+  http_code="$(api_get "${queue_url%/}/api/json?tree=cancelled,why,executable[url,number]" "$body")" || return 1
+  [[ "$http_code" == "200" ]] || return 1
+  cancelled="$(jq -r '.cancelled // false' "$body")"
+  if [[ "$cancelled" == "true" ]]; then
+    state_patch_build "$id" '{"status":"CANCELLED","result":"CANCELLED"}'
+    return
+  fi
+  build_url="$(jq -r '.executable.url // empty' "$body")"
+  number="$(jq -r '.executable.number // empty' "$body")"
+  if [[ -n "$build_url" ]]; then
+    state_patch_build "$id" \
+      "$(jq -cn --arg url "$build_url" --arg number "$number" \
+        '{status: "RUNNING", buildUrl: $url, buildNumber: ($number | tonumber?)}')"
+  else
+    state_patch_build "$id" '{"status":"QUEUED"}'
+  fi
+}
+
+state_refresh_all() {
+  local id failures=0
+  while IFS= read -r id; do
+    [[ -n "$id" ]] || continue
+    state_refresh_build "$id" || (( failures += 1 ))
+  done < <(jq -r --arg url "$jenkins_url" '
+    .builds[]
+    | select(.jenkinsUrl == $url)
+    | select(.status | IN("QUEUEING", "QUEUED", "RUNNING", "CANCELLING", "UNKNOWN"))
+    | .id
+  ' "$state_file")
+  return "$(( failures > 0 ))"
+}
+
+status_icon() {
+  case "$1" in
+    SUCCESS) print -- "${ui_success}✓${ui_reset}" ;;
+    RUNNING|CANCELLING) print -- "${ui_accent}●${ui_reset}" ;;
+    QUEUING|QUEUED) print -- "${ui_warning}○${ui_reset}" ;;
+    FAILURE|ERROR|TIMEOUT) print -- "${ui_danger}✕${ui_reset}" ;;
+    ABORTED|CANCELLED|NOT_BUILT) print -- "${ui_dim}■${ui_reset}" ;;
+    UNSTABLE) print -- "${ui_warning}!${ui_reset}" ;;
+    *) print -- "?" ;;
+  esac
+}
+
+status_mood() {
+  local active failed passed
+  active="$(jq -r --arg url "$jenkins_url" '[.builds[] | select(.jenkinsUrl == $url) | select(.status | IN("QUEUEING", "QUEUED", "RUNNING", "CANCELLING"))] | length' "$state_file")"
+  failed="$(jq -r --arg url "$jenkins_url" '[.builds[] | select(.jenkinsUrl == $url) | select(.status | IN("FAILURE", "ERROR", "TIMEOUT", "ABORTED", "CANCELLED", "UNSTABLE", "NOT_BUILT"))] | length' "$state_file")"
+  passed="$(jq -r --arg url "$jenkins_url" '[.builds[] | select(.jenkinsUrl == $url and .status == "SUCCESS")] | length' "$state_file")"
+  print -- "  $active active · $failed failed · $passed passed"
+  if (( active > 0 )); then
+    print -- "  Jenkins is thinking…"
+  elif (( failed > 0 )); then
+    print -- "  Something needs attention."
+  elif (( passed > 0 )); then
+    print -- "  All green. Nice."
+  fi
+}
+
+cancel_state_build() {
+  local id="$1" record build_state queue_id build_url http_code
+  record="$(state_build_json "$id")"
+  build_state="$(jq -r '.status' <<< "$record")"
+  [[ "$build_state" != "CANCELLING" ]] || { note "Cancellation is already in progress"; return; }
+  state_status_is_active "$build_state" || { note "This build is not active"; return 1; }
+  confirm "Cancel this build?" "no" || return
+  queue_id="$(jq -r '.queueId // empty' <<< "$record")"
+  build_url="$(jq -r '.buildUrl // empty' <<< "$record")"
+  if [[ -n "$build_url" ]]; then
+    state_url_is_safe "$build_url" || fail "Unsafe build URL in state"
+    http_code="$(api_post "${build_url%/}/stop" "$runtime_dir/status-cancel.body")" || http_code="000"
+    case "$http_code" in
+      200|201|302) state_patch_build "$id" '{"status":"CANCELLING"}' ;;
+      *) note "Jenkins rejected cancellation (HTTP $http_code)"; return 1 ;;
+    esac
+  else
+    [[ -n "$queue_id" ]] || fail "Queue ID is missing"
+    http_code="$(api_post "$jenkins_url/queue/cancelItem" "$runtime_dir/status-cancel.body" "id=$queue_id")" || http_code="000"
+    case "$http_code" in
+      200|201|302) state_patch_build "$id" '{"status":"CANCELLED","result":"CANCELLED"}' ;;
+      *) note "Jenkins rejected cancellation (HTTP $http_code)"; return 1 ;;
+    esac
+  fi
+  print -- "Cancellation requested."
+}
+
+job_index_for_path() {
+  local job_path="$1" index
+  for (( index = 1; index <= ${#job_paths[@]}; index += 1 )); do
+    [[ "${job_paths[$index]}" == "$job_path" ]] && { print -r -- "$index"; return; }
+  done
+  return 1
+}
+
+retry_state_build() {
+  local id="$1" record build_state job_path index branch issue_key comments attempt new_id queue_url queue_id
+  local parameters_json parameter build_url elapsed=0
+  local -a parameters=()
+  record="$(state_build_json "$id")"
+  build_state="$(jq -r '.status' <<< "$record")"
+  state_status_is_retryable "$build_state" || { note "Only failed or cancelled builds can be retried"; return 1; }
+  confirm "Retry this build?" "yes" || return
+  job_path="$(jq -r '.jobPath' <<< "$record")"
+  index="$(job_index_for_path "$job_path")" || { note "This job is no longer configured"; return 1; }
+  branch="$(jq -r '.branch' <<< "$record")"
+  issue_key="$(jq -r '.issueKey // empty' <<< "$record")"
+  comments="$(jq -r '.comments // false' <<< "$record")"
+  attempt="$(( $(jq -r '.attempt // 1' <<< "$record") + 1 ))"
+  parameters_json="$(jq -c '.parameters // []' <<< "$record")"
+  while IFS= read -r parameter; do
+    parameters+=("$parameter")
+  done < <(jq -r '.parameters[]?' <<< "$record")
+
+  new_id="$(state_add_build "$index" "$branch" "$issue_key" "$comments" "$parameters_json" "$id" "$attempt")"
+  queue_url="$(trigger_build "$index" "${parameters[@]}")" || {
+    state_patch_build "$new_id" '{"status":"ERROR","result":"TRIGGER_FAILED"}'
+    note "Retry could not be queued"
+    return 1
+  }
+  queue_id="${${queue_url%/}:t}"
+  state_patch_build "$new_id" \
+    "$(jq -cn --arg url "$queue_url" --arg queueId "$queue_id" \
+      '{status: "QUEUED", queueUrl: $url, queueId: $queueId}')"
+  print -- "Queued retry #$attempt."
+
+  while (( elapsed < queue_timeout )); do
+    state_refresh_build "$new_id" || true
+    record="$(state_build_json "$new_id")"
+    build_url="$(jq -r '.buildUrl // empty' <<< "$record")"
+    [[ -n "$build_url" ]] && break
+    build_state="$(jq -r '.status' <<< "$record")"
+    state_status_is_active "$build_state" || break
+    sleep 3
+    (( elapsed += 3 ))
+  done
+  if [[ -n "$build_url" ]]; then
+    print -- "Started: $build_url"
+    if [[ "$comments" == "true" && "$issue_enabled" == "true" && -n "$issue_key" ]]; then
+      start_state_watcher "${job_config_indices[$index]}" "$branch" "$issue_key" "$new_id" "$build_url"
+    fi
+  fi
+}
+
+status_detail_menu() {
+  local id="$1" record build_state label branch number url choice icon attempt
+  while true; do
+    state_refresh_build "$id" || true
+    record="$(state_build_json "$id")"
+    [[ -n "$record" ]] || return
+    build_state="$(jq -r '.status' <<< "$record")"
+    label="$(jq -r '.jobLabel' <<< "$record")"
+    branch="$(jq -r '.branch' <<< "$record")"
+    number="$(jq -r '.buildNumber // empty' <<< "$record")"
+    url="$(jq -r '.buildUrl // .queueUrl // empty' <<< "$record")"
+    attempt="$(jq -r '.attempt // 1' <<< "$record")"
+    icon="$(status_icon "$build_state")"
+    ui_title "$icon $label${number:+ #$number}"
+    print -- "  $build_state · attempt $attempt"
+    print -- "  $branch"
+    [[ -n "$url" ]] && print -- "  ${ui_dim}$url${ui_reset}"
+    print
+    menu_reset
+    [[ "$build_state" != "CANCELLING" ]] && state_status_is_active "$build_state" && menu_add c "Cancel"
+    state_status_is_retryable "$build_state" && menu_add y "Retry"
+    [[ -n "$url" ]] && menu_add o "Open in Jenkins"
+    menu_add r "Refresh"
+    menu_add b "Back"
+    menu_select
+    choice="$menu_choice"
+    case "$choice" in
+      c) cancel_state_build "$id" ;;
+      y) retry_state_build "$id"; return ;;
+      o) state_url_is_safe "$url" && /usr/bin/open "$url" || note "Unsafe Jenkins URL" ;;
+      r) ;;
+      b|q) return ;;
+    esac
+  done
+}
+
+status_print() {
+  local build_state label branch number url
+  while IFS=$'\t' read -r build_state label branch number url; do
+    printf '%-11s %-22s %-8s %s\n' "$build_state" "$label" "${number:+#$number}" "$branch"
+    [[ -n "$url" ]] && print -- "            $url"
+  done < <(jq -r --arg jenkins "$jenkins_url" '
+    .builds
+    | map(select(.jenkinsUrl == $jenkins))
+    | sort_by(.createdEpoch) | reverse | .[:50][]
+    | [.status, .jobLabel, .branch, (.buildNumber // "" | tostring), (.buildUrl // .queueUrl // "")]
+    | @tsv
+  ' "$state_file")
+}
+
+status_interactive() {
+  local choice record id build_state label branch number icon index
+  local -a ids=()
+  while true; do
+    state_refresh_all || true
+    ui_title "Build status"
+    status_mood
+    print
+    menu_reset
+    ids=()
+    index=0
+    while IFS= read -r record; do
+      (( index += 1 ))
+      id="$(jq -r '.id' <<< "$record")"
+      build_state="$(jq -r '.status' <<< "$record")"
+      label="$(jq -r '.jobLabel' <<< "$record")"
+      branch="$(jq -r '.branch' <<< "$record")"
+      number="$(jq -r '.buildNumber // empty' <<< "$record")"
+      icon="$(status_icon "$build_state")"
+      ids[$index]="$id"
+      menu_add "$index" "$icon $label${number:+ #$number}" "$build_state · $branch"
+    done < <(jq -c --arg jenkins "$jenkins_url" '
+      .builds | map(select(.jenkinsUrl == $jenkins))
+      | sort_by(.createdEpoch) | reverse | .[:50][]
+    ' "$state_file")
+    menu_add r "Refresh"
+    menu_add q "Done"
+    menu_select
+    choice="$menu_choice"
+    case "$choice" in
+      r) ;;
+      q) return ;;
+      ''|*[!0-9]*) ;;
+      *) [[ -n "${ids[$choice]:-}" ]] && status_detail_menu "${ids[$choice]}" ;;
+    esac
+  done
+}
+
+status_command() {
+  local json="false" count
+  while (( $# > 0 )); do
+    case "$1" in
+      --json) json="true"; shift ;;
+      -h|--help) help_status; return ;;
+      *) fail "Unknown status option: $1" ;;
+    esac
+  done
+  state_init
+  count="$(jq -r --arg url "$jenkins_url" '[.builds[] | select(.jenkinsUrl == $url)] | length' "$state_file")"
+  if (( count == 0 )); then
+    [[ "$json" == "true" ]] && print -- '[]' || print -- "No builds yet. Run: jenkins-batch run"
+    return
+  fi
+  load_jenkins_token
+  load_runtime
+  prepare_jenkins_session
+  if [[ "$json" == "true" ]]; then
+    state_refresh_all || note "Some build statuses could not be refreshed"
+    jq --arg url "$jenkins_url" '[.builds[] | select(.jenkinsUrl == $url)]' "$state_file"
+  elif [[ -t 0 && -t 1 ]]; then
+    init_ui
+    status_interactive
+  else
+    state_refresh_all || note "Some build statuses could not be refreshed"
+    status_print
+  fi
+  cleanup
 }
 
 find_cancelable_builds() {
@@ -2396,14 +2912,20 @@ post_issue_comment() {
 }
 
 watch_build() {
-  local launchd_label="$1" branch="$2" issue_key="$3" index="$4" build_url="$5"
+  local launchd_label="$1" branch="$2" issue_key="$3" index="$4" state_id="$5" build_url="$6"
   watcher_label="$launchd_label"
   load_config
   load_jenkins_token
   load_issue_token
   load_runtime
-  local result console_file links details comment
+  state_init
+  local result state_status console_file links details comment
   result="$(wait_for_build_result "$index" "$build_url")"
+  state_status="$result"
+  [[ "$result" == "API_ERROR" ]] && state_status="ERROR"
+  state_patch_build "$state_id" \
+    "$(jq -cn --arg status "$state_status" --arg result "$result" \
+      '{status: $status, result: $result}')"
   if [[ "$result" != "SUCCESS" ]]; then
     note "${job_labels[$index]}: $result; no comment posted"
     launchctl remove "$launchd_label" >/dev/null 2>&1
@@ -2436,33 +2958,44 @@ watch_build() {
   launchctl remove "$launchd_label" >/dev/null 2>&1
 }
 
+start_state_watcher() {
+  local index="$1" branch="$2" issue_key="$3" state_id="$4" build_url="$5"
+  mkdir -p "$log_dir" || fail "Could not create watcher log directory: $log_dir"
+  local timestamp launchd_label log_file safe_key
+  timestamp="$(date '+%Y%m%d-%H%M%S')"
+  safe_key="$(print -r -- "${issue_key:-$branch}" | tr '[:upper:]' '[:lower:]' | tr -cd '[:alnum:]._-')"
+  [[ -n "$safe_key" ]] || safe_key="build"
+  launchd_label="io.github.heartsker.jenkins-batch.$safe_key.$index.$timestamp.$$"
+  log_file="$log_dir/$safe_key-job-$index-$timestamp-$$.log"
+  launchctl submit \
+    -l "$launchd_label" \
+    -o "$log_file" \
+    -e "$log_file" \
+    -- /usr/bin/env \
+    JENKINS_BATCH_CONFIG="$config_file" \
+    JENKINS_BATCH_STATE="$state_file" \
+    "$SCRIPT_PATH" __watch "$launchd_label" "$branch" "$issue_key" "$index" "$state_id" "$build_url" \
+    || fail "Build started, but its completion watcher could not start"
+}
+
 start_watchers() {
   local branch="$1" issue_key="$2"
-  mkdir -p "$log_dir" || fail "Could not create watcher log directory: $log_dir"
-  local timestamp index launchd_label log_file safe_key count=0
-  timestamp="$(date '+%Y%m%d-%H%M%S')"
-  safe_key="$(print -r -- "$issue_key" | tr '[:upper:]' '[:lower:]' | tr -cd '[:alnum:]._-')"
+  local index count=0
   for (( index = 1; index <= ${#job_labels[@]}; index += 1 )); do
     [[ -n "${pipeline_urls[$index]:-}" ]] || continue
-    launchd_label="io.github.heartsker.jenkins-batch.$safe_key.$index.$timestamp.$$"
-    log_file="$log_dir/$safe_key-job-$index-$timestamp-$$.log"
-    launchctl submit \
-      -l "$launchd_label" \
-      -o "$log_file" \
-      -e "$log_file" \
-      -- /usr/bin/env JENKINS_BATCH_CONFIG="$config_file" \
-      "$SCRIPT_PATH" __watch "$launchd_label" "$branch" "$issue_key" "${job_config_indices[$index]}" "${pipeline_urls[$index]}" \
-      || fail "Builds started, but a completion watcher could not start"
+    start_state_watcher \
+      "${job_config_indices[$index]}" "$branch" "$issue_key" \
+      "${run_state_ids[$index]}" "${pipeline_urls[$index]}"
     (( count += 1 ))
   done
-  print -- "Watching $count builds. Logs: $log_dir"
+  print -- "Watching $count builds."
 }
 
 main() {
   local command="${1:-help}"
   [[ $# -gt 0 ]] && shift
   if [[ "$command" == "__watch" ]]; then
-    (( $# == 5 )) || fail "Invalid watcher invocation"
+    (( $# == 6 )) || fail "Invalid watcher invocation"
     watch_build "$@"
     return
   fi
@@ -2471,7 +3004,7 @@ main() {
     setup) setup_command "$@" ;;
     doctor) ensure_config; doctor "$@" ;;
     config) config_command "$@" ;;
-    jobs) ensure_config; load_config; jobs_command "$@" ;;
+    status|jobs) ensure_config; load_config; status_command "$@" ;;
     run) ensure_config; load_config; run_command "$@" ;;
     cancel) ensure_config; load_config; cancel_command "$@" ;;
     help|-h|--help) show_help "${1:-}" ;;
