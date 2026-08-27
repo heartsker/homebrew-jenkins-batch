@@ -5,7 +5,7 @@ setopt PIPE_FAIL
 unsetopt BG_NICE
 
 readonly APP_NAME="jenkins-batch"
-readonly APP_VERSION="0.6.0"
+readonly APP_VERSION="0.7.0"
 readonly SCRIPT_PATH="${0:A}"
 readonly JENKINS_KEYCHAIN_SERVICE="io.github.heartsker.jenkins-batch.jenkins"
 readonly ISSUE_KEYCHAIN_SERVICE="io.github.heartsker.jenkins-batch.issue-tracker"
@@ -71,7 +71,7 @@ jenkins-batch — run and manage Jenkins builds.
 
 Commands:
   setup    Configure jobs and credentials
-  run      Start configured builds
+  run      Choose and start builds
   status   Watch, cancel, or retry builds
   doctor   Check local setup
 
@@ -95,15 +95,14 @@ help_run() {
   cat <<'HELP'
 jenkins-batch run [TARGET ...] [options]
 
-Queues selected jobs, waits until each leaves the Jenkins queue, prints
-the build URLs, then exits. If issue comments are enabled, small background
-watchers post one comment for each successful build.
+Opens a job picker in an interactive terminal. Jobs enabled by default in the
+config are already selected. After confirmation, waits until each build leaves
+the Jenkins queue and prints its URL.
 
 Examples:
   jenkins-batch run
   jenkins-batch run feature/APP-123-new-flow
   jenkins-batch run APP-123 APP-124
-  jenkins-batch run --select
   jenkins-batch run --job "Simulator QA" --job Device
   jenkins-batch run --all
   jenkins-batch run APP-123 --dry-run --verbose
@@ -2319,7 +2318,7 @@ select_jobs_for_run() {
       done
       ;;
   esac
-  (( ${#selected[@]} > 0 )) || fail "No jobs selected. Use --select, --job NAME, or --all"
+  (( ${#selected[@]} > 0 )) || fail "No default jobs. Run interactively or use --job NAME or --all"
   apply_job_selection "${selected[@]}"
 }
 
@@ -2363,6 +2362,9 @@ run_command() {
   (( ${#targets[@]} > 0 )) || targets=("")
   (( ${#targets[@]} == 1 )) || [[ -z "$issue_override" ]] \
     || fail "--issue can only be used with one target"
+  if [[ "$selection_mode" == "default" && -t 0 && -t 1 ]]; then
+    selection_mode="interactive"
+  fi
   select_jobs_for_run "$selection_mode" "${job_selectors[@]}"
   local selection_result=$?
   if (( selection_result == 2 )); then

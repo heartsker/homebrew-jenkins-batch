@@ -22,6 +22,7 @@ jobs:
           bin/jenkins-batch help
           bin/jenkins-batch help setup | grep -q 'arrow keys and Enter'
           bin/jenkins-batch help | grep -q '^  setup    Configure jobs and credentials$'
+          bin/jenkins-batch help | grep -q '^  run      Choose and start builds$'
           bin/jenkins-batch help | grep -q '^  status   Watch, cancel, or retry builds$'
           ! bin/jenkins-batch help | grep -q 'jenkins-batch jobs'
           ! bin/jenkins-batch help | grep -Eq 'setup --|config wizard'
@@ -93,10 +94,20 @@ jobs:
           PATH="$smoke_dir/bin:$PATH" \
             JENKINS_BATCH_CONFIG="$smoke_dir/config.json" \
             bin/jenkins-batch run feature/APP-123-demo --all --dry-run
+          printf '\r' | script -q /dev/null env \
+            PATH="$smoke_dir/bin:$PATH" \
+            JENKINS_BATCH_CONFIG="$smoke_dir/config.json" \
+            bin/jenkins-batch run feature/APP-123-demo --dry-run --verbose >"$smoke_dir/run-defaults.log"
+          grep -q 'Choose builds' "$smoke_dir/run-defaults.log"
+          grep -q '• Simulator QA →' "$smoke_dir/run-defaults.log"
+          ! grep -q '• Simulator Debug →' "$smoke_dir/run-defaults.log"
           printf '\033[B \r' | script -q /dev/null env \
             PATH="$smoke_dir/bin:$PATH" \
             JENKINS_BATCH_CONFIG="$smoke_dir/config.json" \
-            bin/jenkins-batch run feature/APP-123-demo --select --dry-run >/dev/null
+            bin/jenkins-batch run feature/APP-123-demo --dry-run --verbose >"$smoke_dir/run-picker.log"
+          grep -q 'Choose builds' "$smoke_dir/run-picker.log"
+          grep -q '• Simulator QA →' "$smoke_dir/run-picker.log"
+          grep -q '• Simulator Debug →' "$smoke_dir/run-picker.log"
           cp "$smoke_dir/config.json" "$smoke_dir/before-wizard.json"
           printf '1\n1\nhttps://ci.example.com\nb\ns\n' | \
             PATH="$smoke_dir/bin:$PATH" \

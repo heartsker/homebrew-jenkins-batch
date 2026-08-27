@@ -21,13 +21,13 @@ save tokens to macOS Keychain. `run` opens setup automatically when needed.
 
 ```sh
 jenkins-batch run
-jenkins-batch run --select
 jenkins-batch run --job "Simulator QA"
 jenkins-batch run --all
 jenkins-batch run APP-123
 ```
 
-`--select` uses arrow keys and Space to choose any combination of builds.
+`run` opens a picker in the terminal. Jobs with `enabledByDefault: true` are
+preselected; use arrow keys and Space to change the selection, then press Enter.
 
 ## Status
 
